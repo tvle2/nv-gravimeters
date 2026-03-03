@@ -1,5 +1,4 @@
-# Gravimeter RL (paper-faithful fixed-mass version)
-
+# Gravimeter RL
 This repo contains a cleaned-up version of your RBPF+RL pipeline aligned to:
 - Main text phase model: ΔΦ = (2η/y0) g T^2 + 16π η_g η
 - Supplement visibility: A(η,δt) from Eq. S65
