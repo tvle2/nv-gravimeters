@@ -1,17 +1,4 @@
 # pl_brl/rl_pipeline.py
-"""
-RL pipeline utilities:
-  - masked joint-action ActorCritic (hard constraints)
-  - expert heuristic dataset generation (physics-driven)
-  - behavior cloning (Top-K BC)
-  - PPO fine-tuning
-  - evaluation
-
-This version is aligned with env_rbpf.py:
-  - k_g includes both terms from paper ΔΦ
-  - optional MFG amplitude noise is included in the expert score proxy as dephasing at current mu_g
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -72,10 +59,10 @@ class ActorCriticMasked(nn.Module):
         self.dt_half = 0.5 * (dtmax - dtmin)
 
         # indices in the obs vector after hist
-        self.mu_g_idx = self.bins + 0
-        self.std_g_idx_feat = self.bins + 1
-        self.mu_dt_idx = self.bins + 2
-        self.std_dt_idx = self.bins + 3
+        self.mu_g_idx = self.bins + 3
+        self.std_g_idx_feat = self.bins + 4
+        self.mu_dt_idx = self.bins + 5
+        self.std_dt_idx = self.bins + 6
 
         self._scale_ready = True
 
@@ -189,17 +176,6 @@ class ActorCriticMasked(nn.Module):
 
 # ----------------------------- dataset (expert) -----------------------------
 def expert_scores(env, obs: np.ndarray) -> np.ndarray:
-    """
-    Expert score table [nT, nB] for NO-PROBE experiments.
-
-    Uses an information proxy aligned with the measurement model:
-        score ~ (A_eff)^2 * k^2
-
-    plus a soft penalty for operating near the wrap boundary.
-
-    Hard-gates actions that violate:
-        sigma_theta = m * std_g * k <= 2*pi*wrap_max
-    """
     if getattr(env.cfg, "probe_every", 0) != 0:
         raise RuntimeError("expert_scores(): expected probe_every=0")
     if getattr(env.cfg, "lambda_dt", 0.0) != 0.0:
@@ -213,10 +189,22 @@ def expert_scores(env, obs: np.ndarray) -> np.ndarray:
     scores = np.full((nT, nB), -np.inf, dtype=np.float64)
 
     m = float(env.cfg.alias_sigma_mult)
-    sigma_theta_max = 2.0 * np.pi * float(env.cfg.wrap_max)
 
-    # soft-penalty weight (tune 0.05–0.5)
-    lam_edge = 0.2
+    wrap_max = float(env.cfg.wrap_max)
+    sigma_theta_max = 2.0 * np.pi * wrap_max
+
+    # --- key knobs (these matter) ---
+    theta_target = 1.0     # rad: desired sigma_theta per step (try 0.7–1.5)
+    beta = 0.5             # how hard to enforce k≈k_star (try 0.2–2.0)
+    lam_edge = 0.2         # penalty near boundary (try 0.05–0.5)
+    margin = 0.85          # safety margin vs hard edge (try 0.7–0.9)
+
+    sigma_theta_safe = sigma_theta_max * margin
+
+    # target k and cap by safe boundary
+    k_target = theta_target / (m * stdg)
+    k_cap = sigma_theta_safe / (m * stdg)
+    k_star = min(k_target, k_cap)
 
     for i in range(nT):
         T_s = float(env.grid.T_vals_s[i])
@@ -228,8 +216,8 @@ def expert_scores(env, obs: np.ndarray) -> np.ndarray:
                 continue
 
             sigma_theta = m * stdg * k
-            if sigma_theta > sigma_theta_max:
-                continue  # hard gate
+            if sigma_theta > sigma_theta_safe:
+                continue  # hard gate with margin
 
             # Visibility mixture under dt particles
             eta = env.model.eta(Bp)
@@ -241,11 +229,19 @@ def expert_scores(env, obs: np.ndarray) -> np.ndarray:
                 phi_nom = float(env.model.delta_phi_scalar(mu_g, T_s, Bp))
                 A_eff *= float(np.exp(-0.5 * (float(env.model.sigma_B_rel) * phi_nom) ** 2))
 
-            info_proxy = (A_eff ** 2) * (k ** 2)
+            # Encourage informative but controlled k:
+            # base info at k_star (NOT k)
+            base = (A_eff ** 2) * (k_star ** 2)
 
-            # soft penalty for being close to the edge
-            edge = sigma_theta / max(sigma_theta_max, 1e-12)  # in [0,1]
-            scores[i, j] = info_proxy - lam_edge * (edge ** 4)
+            # penalize deviating from k_star (log is scale-invariant)
+            log_ratio = np.log(max(k, 1e-12) / max(k_star, 1e-12))
+            pen_k = beta * (log_ratio ** 2)
+
+            # penalize operating close to the safe edge
+            edge = sigma_theta / max(sigma_theta_safe, 1e-12)
+            pen_edge = lam_edge * (edge ** 4)
+
+            scores[i, j] = base - pen_k - pen_edge
 
     return scores
 
@@ -308,10 +304,22 @@ def behavior_cloning_pretrain(
     epochs: int = 10,
     batch_size: int = 2048,
     lr: float = 1e-3,
+    csv_path: str | None = "logs/bc_metrics.csv",
+    run_name: str = "default",
 ) -> None:
     dev = torch.device(device)
     model.to(dev)
     model.train()
+
+    writer = None
+    f_csv = None
+    if csv_path is not None:
+        os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+        csv_exists = os.path.exists(csv_path)
+        f_csv = open(csv_path, "a", newline="")
+        writer = csv.DictWriter(f_csv, fieldnames=["run", "epoch", "topk_nll"])
+        if not csv_exists:
+            writer.writeheader()
 
     opt = optim.Adam(model.parameters(), lr=lr)
 
@@ -321,32 +329,39 @@ def behavior_cloning_pretrain(
     N = obs.shape[0]
     idxs = torch.arange(N, device=dev)
 
-    for ep in range(1, epochs + 1):
-        perm = idxs[torch.randperm(N)]
-        losses = []
-        for start in range(0, N, batch_size):
-            mb = perm[start:start + batch_size]
-            mb_obs = obs[mb]
-            mb_topk = topk[mb]
+    try:
+        for ep in range(1, epochs + 1):
+            perm = idxs[torch.randperm(N)]
+            losses = []
+            for start in range(0, N, batch_size):
+                mb = perm[start:start + batch_size]
+                mb_obs = obs[mb]
+                mb_topk = topk[mb]
 
-            logits = model._masked_joint_logits(mb_obs)  # [B,A]
-            logp_all = logits - torch.logsumexp(logits, dim=1, keepdim=True)
+                logits = model._masked_joint_logits(mb_obs)  # [B,A]
+                logp_all = logits - torch.logsumexp(logits, dim=1, keepdim=True)
 
-            mask_valid = mb_topk >= 0
-            safe_topk = mb_topk.clamp_min(0)
+                mask_valid = mb_topk >= 0
+                safe_topk = mb_topk.clamp_min(0)
 
-            gathered = logp_all.gather(1, safe_topk)
-            gathered = gathered.masked_fill(~mask_valid, -1e9)
+                gathered = logp_all.gather(1, safe_topk)
+                gathered = gathered.masked_fill(~mask_valid, -1e9)
 
-            log_mass = torch.logsumexp(gathered, dim=1)
-            loss = (-log_mass).mean()
+                log_mass = torch.logsumexp(gathered, dim=1)
+                loss = (-log_mass).mean()
 
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            opt.step()
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                opt.step()
 
-            losses.append(float(loss.item()))
-        print(f"[BC] epoch {ep}/{epochs} | topk_nll={np.mean(losses):.6f}")
+                losses.append(float(loss.item()))
+            print(f"[BC] epoch {ep}/{epochs} | topk_nll={np.mean(losses):.6f}")
+            if writer is not None:
+                writer.writerow({"run": run_name, "epoch": ep, "topk_nll": float(np.mean(losses))})
+                f_csv.flush()
+    finally:
+        if f_csv is not None:
+            f_csv.close()
 
 
 # ----------------------------- PPO -----------------------------
@@ -430,6 +445,10 @@ def ppo_train(
             "cat_rate_g",
             "mean_post_std_g",
             "probe_rate",
+            "pi_loss", 
+            "v_loss", 
+            "entropy", 
+            "total_loss",
         ],
     )
     if not csv_exists:
@@ -479,7 +498,9 @@ def ppo_train(
 
                     if d:
                         # episode-end metrics
-                        g_err = float(info["post_mu_g"] - info["true_g"])
+                        true_g = float(info["true_g"])
+                        g_map = float(env.belief.g_map())
+                        g_err = g_map - true_g
                         g_std = float(info["post_std_g"])
 
                         win_returns.append(float(ep_return[i]))
@@ -507,6 +528,13 @@ def ppo_train(
             ret_b = ret.reshape(B)
 
             idxs = torch.arange(B, device=dev)
+
+            pi_losses = []
+            v_losses = []
+            entropies = []
+            total_losses = []
+
+
             for _ in range(cfg.update_epochs):
                 perm = idxs[torch.randperm(B)]
                 for start in range(0, B, cfg.minibatch_size):
@@ -529,6 +557,11 @@ def ppo_train(
                     ent_loss = -ent.mean()
 
                     loss = pi_loss + cfg.vf_coef * v_loss + cfg.ent_coef * ent_loss
+
+                    pi_losses.append(float(pi_loss.item()))
+                    v_losses.append(float(v_loss.item()))
+                    entropies.append(float(ent.mean().item()))
+                    total_losses.append(float(loss.item()))
 
                     opt.zero_grad(set_to_none=True)
                     loss.backward()
@@ -571,6 +604,10 @@ def ppo_train(
                         "cat_rate_g": cat_rate_g,
                         "mean_post_std_g": mean_post_std_g,
                         "probe_rate": probe_rate,
+                        "pi_loss": float(np.mean(pi_losses)) if len(pi_losses) else float("nan"),
+                        "v_loss": float(np.mean(v_losses)) if len(v_losses) else float("nan"),
+                        "entropy": float(np.mean(entropies)) if len(entropies) else float("nan"),
+                        "total_loss": float(np.mean(total_losses)) if len(total_losses) else float("nan"),
                     }
                 )
                 f_csv.flush()
@@ -586,49 +623,6 @@ def ppo_train(
         f_csv.close()
 
 
-# @torch.no_grad()
-# def evaluate_policy(env, model: ActorCriticMasked, episodes: int = 80, device: str = "cpu") -> Dict[str, float]:
-#     dev = torch.device(device)
-#     model.eval()
-#     model.to(dev)
-
-#     g_errs, g_stds = [], []
-#     dt_errs, dt_stds = [], []
-#     phi_errs = []
-
-#     for _ in range(episodes):
-#         obs = torch.tensor(env.reset(), dtype=torch.float32, device=dev)
-#         done = False
-#         last = None
-
-#         while not done:
-#             aT, aB = model.greedy(obs)
-#             obs_np, _, done, info = env.step(aT, aB)
-#             obs = torch.tensor(obs_np, dtype=torch.float32, device=dev)
-#             last = info
-
-#         assert last is not None
-#         g_errs.append(last["post_mu_g"] - last["true_g"])
-#         g_stds.append(last["post_std_g"])
-
-#         dt_errs.append(last["post_mu_dt"] - last["true_dt"])
-#         dt_stds.append(last["post_std_dt"])
-
-#         dphi = (last["post_mu_phi"] - last["true_phi"] + np.pi) % (2.0 * np.pi) - np.pi
-#         phi_errs.append(dphi)
-
-#     g_errs = np.asarray(g_errs)
-#     dt_errs = np.asarray(dt_errs)
-#     phi_errs = np.asarray(phi_errs)
-
-#     return {
-#         "rmse_g": float(np.sqrt(np.mean(g_errs ** 2))),
-#         "mean_post_std_g": float(np.mean(g_stds)),
-#         "rmse_dt": float(np.sqrt(np.mean(dt_errs ** 2))),
-#         "mean_post_std_dt": float(np.mean(dt_stds)),
-#         "mean_abs_phi_err_rad": float(np.mean(np.abs(phi_errs))),
-#     }
-
 @torch.no_grad()
 def evaluate_policy(
     env,
@@ -640,12 +634,16 @@ def evaluate_policy(
     verbose_cats: bool = True,    # <-- print details for catastrophic episodes
     A_low_thresh: float = 0.10,        # define “low visibility”
     overconf_std_g_max: float = 0.005, # define “overconfident” (tight posterior)
+    policy_mode: str = "sample",  # "sample" or "greedy"
 ) -> Dict[str, float]:
     dev = torch.device(device)
     model.eval()
     model.to(dev)
 
-    g_errs, g_stds = [], []
+    # g_errs, g_stds = [], []
+    g_err_map_list, g_err_mean_list, g_err_med_list = [], [], []
+    g_stds = []
+
     dt_errs, dt_stds = [], []
     phi_errs = []
 
@@ -691,7 +689,15 @@ def evaluate_policy(
             valid_fracs.append(valid_frac)
             valid_counts.append(valid_count)
 
-            aT, aB = model.greedy(obs)
+            # aT, aB = model.greedy(obs)
+            if policy_mode == "greedy":
+                aT, aB = model.greedy(obs)
+            elif policy_mode == "sample":
+                aT_t, aB_t, _, _ = model.act(obs.unsqueeze(0))  # act expects [B, obs_dim]
+                aT, aB = int(aT_t.item()), int(aB_t.item())
+            else:
+                raise ValueError(f"Unknown policy_mode={policy_mode}. Use 'greedy' or 'sample'.")
+                                 
             obs_np, _, done, info = env.step(aT, aB)
             obs = torch.tensor(obs_np, dtype=torch.float32, device=dev)
             last = info
@@ -723,15 +729,29 @@ def evaluate_policy(
             valid_count_min_list.append(float("nan"))
 
         # --- baseline metrics ---
-        g_err = float(last["post_mu_g"] - last["true_g"])
+        # g_err = float(last["post_mu_g"] - last["true_g"])
+        true_g = float(last["true_g"])
+
+        g_mean = float(last["post_mu_g"])
+        g_med  = float(env.belief.g_median())
+        g_map  = float(env.belief.g_map())
+        
+        err_mean = g_mean - true_g
+        err_med  = g_med  - true_g
+        err_map  = g_map  - true_g
+
+    
         g_std = float(last["post_std_g"])
+
+        g_err_mean_list.append(err_mean)
+        g_err_med_list.append(err_med)
+        g_err_map_list.append(err_map)
+        g_stds.append(g_std)
+
         dt_err = float(last["post_mu_dt"] - last["true_dt"])
         dt_std = float(last["post_std_dt"])
 
         dphi = float((last["post_mu_phi"] - last["true_phi"] + np.pi) % (2.0 * np.pi) - np.pi)
-
-        g_errs.append(g_err)
-        g_stds.append(g_std)
         dt_errs.append(dt_err)
         dt_stds.append(dt_std)
         phi_errs.append(dphi)
@@ -775,7 +795,11 @@ def evaluate_policy(
         ess_g_list.append(ess_g)
 
         # --- A) catastrophic detection ---
-        is_cat = abs(g_err) > float(err_thresh_g)
+        # is_cat = abs(g_err) > float(err_thresh_g)
+        true_g = float(last["true_g"])
+        g_map  = float(env.belief.g_map())
+        is_cat = abs(err_map) > float(err_thresh_g)
+        
         is_overconf_cat = bool(is_cat and (g_std < float(overconf_std_g_max)))  # <-- ADD
         cat_flags.append(bool(is_cat))
         if is_cat:
@@ -790,7 +814,11 @@ def evaluate_policy(
                 peaks = [(float(env.belief.g_grid[i]), float(p[i])) for i in idx]
 
                 print("\n[CAT EPISODE]")
-                print(f"  ep={ep} | true_g={last['true_g']:.6f} | post_mu_g={last['post_mu_g']:.6f} | err={g_err:+.6f}")
+                print(f"  ep={ep} | true_g={true_g:.6f} | post_mu_g={g_mean:.6f} | err_map={err_map:+.6f}")
+                
+                print(f"  g_mean={g_mean:.6f} | g_med={g_med:.6f} | g_map={g_map:.6f} | true_g={true_g:.6f}")
+                print(f"  err_mean={g_mean-true_g:+.6f} | err_med={g_med-true_g:+.6f} | err_map={g_map-true_g:+.6f}")
+
                 print(f"  post_std_g={g_std:.6f} | entropy_g={ent_g:.3f} | ess_g={ess_g:.1f}")
                 print(f"  k_mean={k_mean:.3e} | k_p95={k_p95:.3e} | k_max={k_max:.3e}")
                 print("  top posterior peaks (g, prob):")
@@ -810,10 +838,12 @@ def evaluate_policy(
             overconf_cat_count += 1
 
     # convert to arrays
-    g_errs = np.asarray(g_errs, dtype=np.float64)
+    g_err_map = np.asarray(g_err_map_list, dtype=np.float64)
+    g_err_mean = np.asarray(g_err_mean_list, dtype=np.float64)
+    g_err_med = np.asarray(g_err_med_list, dtype=np.float64)
+    g_stds = np.asarray(g_stds, dtype=np.float64)
     dt_errs = np.asarray(dt_errs, dtype=np.float64)
     phi_errs = np.asarray(phi_errs, dtype=np.float64)
-    g_stds = np.asarray(g_stds, dtype=np.float64)
     dt_stds = np.asarray(dt_stds, dtype=np.float64)
 
     k_max_arr = np.asarray(k_max_list, dtype=np.float64)
@@ -833,7 +863,7 @@ def evaluate_policy(
     valid_count_min_arr = np.asarray(valid_count_min_list, dtype=np.float64)
 
     # --- C) correlations (safe) ---
-    abs_err = np.abs(g_errs)
+    abs_err = np.abs(g_err_map)
     sigma = g_stds + 1e-12
     z = abs_err / sigma
 
@@ -856,6 +886,17 @@ def evaluate_policy(
     def nanmean(x):
         x = np.asarray(x, dtype=np.float64)
         return float(np.nanmean(x)) if np.any(np.isfinite(x)) else float("nan")
+    
+    def rmse(x: np.ndarray) -> float:
+        return float(np.sqrt(np.mean(x * x)))
+
+    rmse_g_map  = rmse(g_err_map)
+    rmse_g_mean = rmse(g_err_mean)
+    rmse_g_med  = rmse(g_err_med)
+
+    cat_rate_map  = float(np.mean(np.abs(g_err_map)  > err_thresh_g))
+    cat_rate_mean = float(np.mean(np.abs(g_err_mean) > err_thresh_g))
+    cat_rate_med  = float(np.mean(np.abs(g_err_med)  > err_thresh_g))
     
     # compare k between catastrophic vs not
     if np.any(cat_arr) and np.any(~cat_arr):
@@ -881,15 +922,24 @@ def evaluate_policy(
         vcountmin_cat = vcountmin_ok = float("nan")
 
     return {
-        "rmse_g": float(np.sqrt(np.mean(g_errs ** 2))),
+        # --- g metrics (3 estimators) ---
+        "rmse_g_map": rmse_g_map,
+        "rmse_g_mean": rmse_g_mean,
+        "rmse_g_median": rmse_g_med,
+
+        "cat_thresh_g": float(err_thresh_g),
+        "cat_rate_g_map": cat_rate_map,
+        "cat_rate_g_mean": cat_rate_mean,
+        "cat_rate_g_median": cat_rate_med,
+
+        "rmse_g": rmse_g_map,
         "mean_post_std_g": float(np.mean(g_stds)),
         "rmse_dt": float(np.sqrt(np.mean(dt_errs ** 2))),
         "mean_post_std_dt": float(np.mean(dt_stds)),
         "mean_abs_phi_err_rad": float(np.mean(np.abs(phi_errs))),
 
-        "cat_thresh_g": float(err_thresh_g),
         "cat_count_g": int(cat_count),
-        "cat_rate_g": float(cat_count) / max(1, int(episodes)),
+        "cat_rate_g": cat_rate_map,
 
         "mean_entropy_g": float(np.mean(ent_g_arr)),
         "mean_ess_g": float(np.mean(ess_g_arr)),

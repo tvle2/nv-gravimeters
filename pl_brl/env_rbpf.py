@@ -1,37 +1,4 @@
 # pl_brl/env_rbpf.py
-"""
-Paper-faithful RBPF environment for the levitated-nanoparticle gravimeter.
-
-Latent parameters (true + belief):
-  - g : gravitational acceleration (constant over an episode)
-  - dt: control-time error δt from trap-frequency noise (constant over an episode)
-  - phi_off: unknown phase offset aggregating ζ(δt)+φ0(α0,δt) (slowly drifting)
-
-Visibility model (Supplement Eq. S65):
-  A = exp(-(16 η cos(ωδt/4) sin^2(3ωδt/4))^2 / 2),
-  η(B') = γ_e * (B' [T/m]) * y0 / ω,
-  y0 = sqrt(ħ / (2 M ω)).
-
-Phase model (Main text Eq. (3)):
-  ΔΦ = (2η/y0) g T^2 + 16π η_g η.
-
-With physical units restored, η_g = M g y0 / (ħ ω),
-and the 16π η_g η term is also linear in g and simplifies to:
-  16π η_g η = (8π γ_e B' / ω^3) * g   (ħ cancels, M cancels).
-
-So we implement:
-  ΔΦ(g;T,B') = k_g(T,B') * g
-  k_g(T,B')  = (2γ/ω) B' T^2 + (8π γ / ω^3) B'.
-
-Measurement model:
-  P_plus = 0.5 * (1 + A(η,dt) * cos(ΔΦ + phi_off + varphi))
-
-Optional MFG amplitude noise (Supplement discussion):
-  B' -> B'(1+ε), ε ~ N(0, sigma_B_rel).
-We marginalize this in the filter likelihood via:
-  E[cos((1+ε)*φ)] = exp(-0.5*(sigma_B_rel*φ)^2) * cos(φ),
-which acts as an additional g-dependent dephasing factor.
-"""
 
 from __future__ import annotations
 
@@ -262,7 +229,29 @@ class RBPFGravBelief:
         if m.sigma_dt_drift > 0.0:
             self.dt = self.dt + self.rng.normal(0.0, m.sigma_dt_drift, size=self.cfg.n_nuisance)
         self.phi = wrap_to_pi(self.phi + self.rng.normal(0.0, m.sigma_phi_drift, size=self.cfg.n_nuisance))
+    
+    def g_map(self) -> float:
+        p = self.w_g_marginal()
+        idx = int(np.argmax(p))
+        return float(self.g_grid[idx])
 
+    def g_median(self) -> float:
+        p = self.w_g_marginal()
+        cdf = np.cumsum(p)
+        return float(np.interp(0.5, cdf, self.g_grid))
+
+    def g_peak_stats(self) -> dict:
+        p = self.w_g_marginal()
+        idx1 = int(np.argmax(p))
+        p1 = float(p[idx1])
+
+        # second-highest probability (robust)
+        p_copy = p.copy()
+        p_copy[idx1] = -np.inf
+        p2 = float(np.max(p_copy))
+
+        return {"p1": p1, "p2": p2, "gap": p1 - p2}
+    
     def w_g_marginal(self) -> np.ndarray:
         """
         Stable marginal mixture:
@@ -504,7 +493,7 @@ class GravimeterEnvPaperRBPF:
 
     @property
     def obs_dim(self) -> int:
-        return int(self.cfg.g_hist_bins) + 9
+        return int(self.cfg.g_hist_bins) + 12
 
     def _is_probe_now(self) -> bool:
         return (self.cfg.probe_every > 0) and ((self.k % self.cfg.probe_every) == 0) and (self.k > 0)
@@ -525,6 +514,17 @@ class GravimeterEnvPaperRBPF:
         gmin, gmax = self.prior.g_range
 
         wg = self.belief.w_g_marginal().astype(np.float32)
+        p = wg  # [Ng] already normalized
+        idx1 = int(np.argmax(p))
+        p1 = float(p[idx1])
+
+        p_copy = p.copy()
+        p_copy[idx1] = -1.0
+        p2 = float(np.max(p_copy))
+        gap = float(p1 - p2)
+
+        ent_g = float(-np.sum(p * np.log(p + 1e-12)))
+
         g_grid = self.belief.g_grid
 
         edges = np.linspace(gmin, gmax, bins + 1)
@@ -543,6 +543,7 @@ class GravimeterEnvPaperRBPF:
                 hist,
                 np.array(
                     [
+                        p1, gap, ent_g,
                         st["mu_g"], st["std_g"],
                         st["mu_dt"], st["std_dt"],
                         np.cos(mu_phi), np.sin(mu_phi), st["R_phi"],

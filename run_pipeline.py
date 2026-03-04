@@ -15,6 +15,12 @@ from pl_brl.rl_pipeline import (
     evaluate_policy,
 )
 
+def format_sci_no_leading_zero(x: float, sig: int = 0) -> str:
+    # Start from scientific notation like "1e-04"
+    s = f"{x:.{sig}e}"
+    # Turn "e-04" -> "e-4" and "e+04" -> "e+4"
+    s = s.replace("e-0", "e-").replace("e+0", "e+")
+    return s
 
 def make_grids(
     n: int = 150,
@@ -59,7 +65,9 @@ def main():
 
     # ---- physics (paper-faithful fixed mass from r=100 nm) ----
     mass = mass_from_radius(r_m=100e-9, rho_kg_m3=3510.0)
-
+    len_episodes = 512
+    sigma_B_rel = 1e-2  # ~Paper note 10% MFG control noise (tuning this changes MFG amplitude noise)
+    
     model = ModelConfig(
         omega_rad_s=2.0 * np.pi * 10e3,
         gamma_e_rad_s_T=2.0 * np.pi * 28e9,
@@ -67,12 +75,12 @@ def main():
         eps_prob=1e-6,
         sigma_phi_drift=0.03,
         sigma_dt_drift=0.0,
-        sigma_B_rel=1e-4,   # ~Paper note 10% MFG control noise (tuning this changes MFG amplitude noise)
+        sigma_B_rel=sigma_B_rel,
     )
 
     # ---- env config ----
     env_cfg = EnvConfig(
-        episode_len=120, #60
+        episode_len=len_episodes, #60
         n_g_grid=512, #2048
         n_nuisance=64, #256
         g_hist_bins=30,
@@ -92,7 +100,7 @@ def main():
     ppo_cfg = PPOConfig(
         device="cpu",
         n_envs=8, #8
-        rollout_steps=240, #512
+        rollout_steps=256, #512
         update_epochs=4, #6
         minibatch_size=512,
         lr=3e-4,
@@ -130,8 +138,8 @@ def main():
     dg2pi_flat = torch.tensor(dg2pi.reshape(-1), dtype=torch.float32, device=dev)
 
     bins = int(env_cfg.g_hist_bins)
-    std_g_index = bins + 1
-    probe_index = bins + 8  # last element
+    std_g_index = bins + 4
+    probe_index = bins + 11  # last element
 
     policy.set_action_masking(
         dg2pi_flat=dg2pi_flat,
@@ -157,10 +165,11 @@ def main():
 
     # ---- [2] BC pretrain ----
     print("\n[2] Behavior cloning pretrain...")
-    behavior_cloning_pretrain(policy, data, device=ppo_cfg.device, epochs=12, batch_size=2048, lr=1e-3)
+    behavior_cloning_pretrain(policy, data, device=ppo_cfg.device, epochs=12, batch_size=2048, lr=1e-3, csv_path="logs/bc_metrics.csv", run_name="debug_512_64")
 
     # ---- [3] PPO finetune ----
     print("\n[3] PPO finetune...")
+    log_path = f"logs_{len_episodes}_sigmaB_{format_sci_no_leading_zero(sigma_B_rel)}/train_metrics.csv"
     policy = ppo_train(
         envs=envs,
         model=policy,
@@ -169,12 +178,13 @@ def main():
         seed=0,
         log_every=20,
         err_thresh_g=0.01,
-        csv_path="logs/train_metrics.csv",
+        csv_path = log_path,
     )
 
     # ---- save ----
     os.makedirs("checkpoints", exist_ok=True)
-    ckpt_path = "checkpoints/paper_rbpf_policy_fixed.pt"
+
+    ckpt_path = f"checkpoints{len_episodes}_sigmaB_{format_sci_no_leading_zero(sigma_B_rel)}/rbpf_policy.pt"
     torch.save(
         {
             "state_dict": policy.state_dict(),
@@ -193,15 +203,15 @@ def main():
 
     # ---- evaluation ----
     eval_env = env_ctor(42)
-    # metrics = evaluate_policy(eval_env, policy, episodes=120, device=ppo_cfg.device)
     metrics = evaluate_policy(
         eval_env,
         policy,
-        episodes=120,
+        episodes=len_episodes,
         device=ppo_cfg.device,
         err_thresh_g=0.01,     # catastrophic = > 0.01 m/s^2
         top_peaks=5,
         verbose_cats=True,
+        policy_mode="sample",   # "greedy" or "sample"
     )
     print("\nEvaluation metrics:", metrics)
 
