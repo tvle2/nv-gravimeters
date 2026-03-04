@@ -102,6 +102,7 @@ class ActorCriticMasked(nn.Module):
         alias_sigma_mult: float,
         alias_frac: float,
         theta_probe_max: float,
+        wrap_max: float = 5.0,
     ) -> None:
         # Allow repeated calls (for evaluation sweeps)
         if hasattr(self, "dg2pi_flat"):
@@ -119,10 +120,14 @@ class ActorCriticMasked(nn.Module):
         self.alias_sigma_mult = float(alias_sigma_mult)
         self.alias_frac = float(alias_frac)
         self.theta_probe_max = float(theta_probe_max)
+
+        self.wrap_max = float(wrap_max)
+        self.sigma_theta_max = float(2.0 * np.pi * self.wrap_max)
+        
         self._mask_ready = True
 
         # recompute fallback each time
-        self.fallback_idx = int(torch.argmax(self.dg2pi_flat).item())
+        self.fallback_idx = int(torch.argmin(self.kg_flat).item())
 
     def forward(self, obs_raw: torch.Tensor):
         obs = self._preprocess_obs_for_net(obs_raw)
@@ -134,20 +139,13 @@ class ActorCriticMasked(nn.Module):
 
     def _compute_mask(self, obs_raw: torch.Tensor) -> torch.Tensor:
         assert self._mask_ready, "Call set_action_masking(...) first."
-        std_g = obs_raw[:, self.std_g_index].clamp_min(0.0)  # RAW physical std_g
-        probe = obs_raw[:, self.probe_index] > 0.5
+        std_g = obs_raw[:, self.std_g_index].clamp_min(0.0)
 
-        dg2pi = self.dg2pi_flat.unsqueeze(0)
         kg = self.kg_flat.unsqueeze(0)
         m = self.alias_sigma_mult
+        sigma_theta = m * std_g.unsqueeze(1) * kg
 
-        alias_ok = (m * std_g.unsqueeze(1)) <= (self.alias_frac * dg2pi)
-        theta_ok = (m * (std_g.unsqueeze(1) * kg)) <= self.theta_probe_max
-
-        mask = alias_ok
-        if probe.any():
-            mask_probe = alias_ok & theta_ok
-            mask = torch.where(probe.unsqueeze(1), mask_probe, mask)
+        mask = sigma_theta <= self.sigma_theta_max
 
         row_ok = mask.any(dim=1)
         if not torch.all(row_ok):
@@ -190,57 +188,64 @@ class ActorCriticMasked(nn.Module):
 
 
 # ----------------------------- dataset (expert) -----------------------------
-
-
 def expert_scores(env, obs: np.ndarray) -> np.ndarray:
     """
-    Returns a score matrix [nT,nB] with -inf for invalid actions.
+    Expert score table [nT, nB] for NO-PROBE experiments.
 
-    Non-probe steps: proxy g-information ~ (A_eff)^2 * k^2 with A_eff reduced by expected MFG-noise dephasing.
-    Probe steps: proxy dt-information using I_dt ≈ (dA/ddt)^2/(1-A^2) (heuristic).
+    Uses an information proxy aligned with the measurement model:
+        score ~ (A_eff)^2 * k^2
+
+    plus a soft penalty for operating near the wrap boundary.
+
+    Hard-gates actions that violate:
+        sigma_theta = m * std_g * k <= 2*pi*wrap_max
     """
-    probe_now = bool(obs[-1] > 0.5)
+    if getattr(env.cfg, "probe_every", 0) != 0:
+        raise RuntimeError("expert_scores(): expected probe_every=0")
+    if getattr(env.cfg, "lambda_dt", 0.0) != 0.0:
+        raise RuntimeError("expert_scores(): expected lambda_dt=0")
+
     st = env.belief.stats()
-    std_g = float(st["std_g"])
+    stdg = max(float(st["std_g"]), 1e-12)
     mu_g = float(st["mu_g"])
 
     nT, nB = env.nT, env.nB
     scores = np.full((nT, nB), -np.inf, dtype=np.float64)
 
-    m = env.cfg.alias_sigma_mult
+    m = float(env.cfg.alias_sigma_mult)
+    sigma_theta_max = 2.0 * np.pi * float(env.cfg.wrap_max)
+
+    # soft-penalty weight (tune 0.05–0.5)
+    lam_edge = 0.2
+
     for i in range(nT):
         T_s = float(env.grid.T_vals_s[i])
         for j in range(nB):
             Bp = float(env.grid.Bp_vals_kTm[j])
 
-            k = env.model.k_g(T_s, Bp)
-            dg2pi = float(2.0 * np.pi / max(k, 1e-30))
-
-            # alias-safety
-            if (m * std_g) > (env.cfg.alias_frac * dg2pi):
-                continue
-            # probe gating
-            if probe_now and (m * std_g * k) > env.cfg.theta_probe_max:
+            k = float(env.model.k_g(T_s, Bp))
+            if not np.isfinite(k) or k <= 0.0:
                 continue
 
+            sigma_theta = m * stdg * k
+            if sigma_theta > sigma_theta_max:
+                continue  # hard gate
+
+            # Visibility mixture under dt particles
             eta = env.model.eta(Bp)
+            A_part = env.model.visibility_A(eta, env.belief.dt)
+            A_eff = float(np.sum(env.belief.w_n * A_part))
 
-            if not probe_now:
-                A_part = env.model.visibility_A(eta, env.belief.dt)
-                A_eff = float(np.sum(env.belief.w_n * A_part))
+            # MFG amplitude noise proxy dephasing
+            if float(env.model.sigma_B_rel) > 0.0:
+                phi_nom = float(env.model.delta_phi_scalar(mu_g, T_s, Bp))
+                A_eff *= float(np.exp(-0.5 * (float(env.model.sigma_B_rel) * phi_nom) ** 2))
 
-                # expected dephasing from marginalizing B-noise at current mu_g
-                if env.model.sigma_B_rel > 0.0:
-                    phi_nom = env.model.delta_phi_scalar(mu_g, T_s, Bp)
-                    A_eff *= float(np.exp(-0.5 * (env.model.sigma_B_rel * phi_nom) ** 2))
+            info_proxy = (A_eff ** 2) * (k ** 2)
 
-                scores[i, j] = (A_eff ** 2) * (k ** 2)
-            else:
-                A_part = env.model.visibility_A(eta, env.belief.dt)
-                dA = env.model.dA_ddt(eta, env.belief.dt)
-                denom = np.maximum(1.0 - A_part ** 2, 1e-9)
-                I_dt = (dA ** 2) / denom
-                scores[i, j] = float(np.sum(env.belief.w_n * I_dt))
+            # soft penalty for being close to the edge
+            edge = sigma_theta / max(sigma_theta_max, 1e-12)  # in [0,1]
+            scores[i, j] = info_proxy - lam_edge * (edge ** 4)
 
     return scores
 

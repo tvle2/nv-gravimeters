@@ -72,25 +72,28 @@ def main():
 
     # ---- env config ----
     env_cfg = EnvConfig(
-        episode_len=60,
-        n_g_grid=2048, #2048
-        n_nuisance=256, #256
+        episode_len=120, #60
+        n_g_grid=512, #2048
+        n_nuisance=64, #256
         g_hist_bins=30,
-        probe_every=4,
-        lambda_dt=0.20,
+        probe_every=0,
+        lambda_dt=0.0,
 
         alias_sigma_mult=3.0,
         alias_frac=0.75,
         theta_probe_max=np.pi / 4.0,
         resample_ess_frac=0.25,
+
+        wrap_max=1.00,                 # NEW (try 3, 5, 8)
+        lambda_cycle=0.0,             # NEW (start 0, then tune up)
     )
 
     # ---- PPO config ----
     ppo_cfg = PPOConfig(
         device="cpu",
         n_envs=8, #8
-        rollout_steps=512, #512
-        update_epochs=6, #6
+        rollout_steps=240, #512
+        update_epochs=4, #6
         minibatch_size=512,
         lr=3e-4,
         ent_coef=0.01,
@@ -136,18 +139,19 @@ def main():
         std_g_index=std_g_index,
         probe_index=probe_index,
         alias_sigma_mult=float(env_cfg.alias_sigma_mult),
-        alias_frac=float(env_cfg.alias_frac),
+        alias_frac=float(env_cfg.alias_frac),         # kept but no longer used
         theta_probe_max=float(env_cfg.theta_probe_max),
+        wrap_max=float(env_cfg.wrap_max),             # NEW
     )
 
     # ---- [1] expert dataset ----
     print("\n[1] Generating expert dataset...")
     data = generate_expert_dataset(
         env_ctor=env_ctor,
-        episodes=500, 
+        episodes=300, #500
         horizon=env_cfg.episode_len,
         seed=0,
-        topk=16, #16
+        topk=8, #16
     )
     print("Dataset transitions:", len(data["aT"]))
 
@@ -161,7 +165,7 @@ def main():
         envs=envs,
         model=policy,
         cfg=ppo_cfg,
-        total_updates=5000,
+        total_updates = 2000,
         seed=0,
         log_every=20,
         err_thresh_g=0.01,

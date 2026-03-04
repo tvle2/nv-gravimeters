@@ -191,6 +191,8 @@ class EnvConfig:
     lambda_T: float = 0.0
     lambda_B: float = 0.0
 
+    lambda_cycle: float = 0.0
+
     # probe schedule + reward shaping
     probe_every: int = 4
     lambda_dt: float = 0.10
@@ -199,6 +201,8 @@ class EnvConfig:
     alias_sigma_mult: float = 3.0
     alias_frac: float = 0.75
     theta_probe_max: float = np.pi / 4.0
+
+    wrap_max: float = 5.0
 
 
 # ----------------------------- belief (PROPER RBPF) -----------------------------
@@ -553,12 +557,18 @@ class GravimeterEnvPaperRBPF:
         assert feat.shape[0] == self.obs_dim, f"obs_dim mismatch: feat={feat.shape[0]} vs obs_dim={self.obs_dim}"
         return feat
 
+    def _entropy_g(self) -> float:
+        p = self.belief.w_g_marginal().astype(np.float64)
+        p = p / (np.sum(p) + 1e-300)
+        return float(-np.sum(p * np.log(p + 1e-300)))
+    
     def reset(self) -> np.ndarray:
         self._sample_true()
         self.belief.reset()
         self.k = 0
 
         st0 = self.belief.stats()
+        self._prev_ent_g = self._entropy_g()
         self._prev_var_g = float(st0["std_g"] ** 2)
         self._prev_var_dt = float(st0["std_dt"] ** 2)
 
@@ -571,13 +581,15 @@ class GravimeterEnvPaperRBPF:
         k_g_nom = float(self.model.k_g(T_s, Bp_kTm))
         dg2pi_nom = float(self.model.dg_period_2pi(T_s, Bp_kTm))
 
-        probe_now = self._is_probe_now()
+        # probe_now = self._is_probe_now()
 
-        # phase-lock choice (fast classical feedback)
-        if probe_now:
-            varphi = self.belief.phase_lock_extrema(T_s, Bp_kTm)
-        else:
-            varphi = self.belief.phase_lock_quadrature(T_s, Bp_kTm)
+        # # phase-lock choice (fast classical feedback)
+        # if probe_now:
+        #     varphi = self.belief.phase_lock_extrema(T_s, Bp_kTm)
+        # else:
+        #     varphi = self.belief.phase_lock_quadrature(T_s, Bp_kTm)
+        probe_now = False  # keep for logging if you want
+        varphi = self.belief.phase_lock_quadrature(T_s, Bp_kTm)
 
         # true shot uses noisy applied gradient
         Bp_true_kTm = self.model.sample_Bp_effective_kTm(self.rng, Bp_kTm)
@@ -600,6 +612,11 @@ class GravimeterEnvPaperRBPF:
 
         # reward: per-shot log-variance reduction in g (+ optional dt on probes)
         st = self.belief.stats()
+
+        ent_g = self._entropy_g()
+        r_ent = self._prev_ent_g - ent_g
+        self._prev_ent_g = ent_g
+
         var_g = float(st["std_g"] ** 2)
         var_dt = float(st["std_dt"] ** 2)
         eps = 1e-14
@@ -607,7 +624,9 @@ class GravimeterEnvPaperRBPF:
         r_g = 0.5 * (np.log(self._prev_var_g + eps) - np.log(var_g + eps))
         self._prev_var_g = var_g
 
-        reward = float(r_g)
+        # reward = float(r_g)
+        # use entropy reduction as the main signal (alias-aware)
+        reward = float(r_ent)
 
         if probe_now and self.cfg.lambda_dt > 0.0:
             r_dt = 0.5 * (np.log(self._prev_var_dt + eps) - np.log(var_dt + eps))
@@ -615,6 +634,12 @@ class GravimeterEnvPaperRBPF:
         self._prev_var_dt = var_dt
 
         reward -= float(self.cfg.lambda_T * T_s + self.cfg.lambda_B * abs(Bp_kTm))
+
+        # tau = 2π/ω, cycle_time = 7τ/2 + 2T
+        if self.cfg.lambda_cycle > 0.0:
+            tau = 2.0 * np.pi / float(self.model.omega_rad_s)
+            cycle_time = 3.5 * tau + 2.0 * T_s
+            reward -= float(self.cfg.lambda_cycle * cycle_time)
 
         self.k += 1
         done = self.k >= self.cfg.episode_len
