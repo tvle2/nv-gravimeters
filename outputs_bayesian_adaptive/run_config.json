@@ -1,0 +1,69 @@
+{
+  "seed": 0,
+  "prior": {
+    "g_range": [
+      9.7639,
+      9.8337
+    ]
+  },
+  "grid": {
+    "n_T": 9,
+    "n_B": 9,
+    "T_vals_s": [
+      5e-05,
+      7.271077167244768e-05,
+      0.0001057371263440564,
+      0.00015376456101806875,
+      0.00022360679774997895,
+      0.0003251724563121182,
+      0.00047287080450158787,
+      0.0006876560219336321,
+      0.001
+    ],
+    "Bp_vals_kTm": [
+      0.5,
+      0.8891397050194614,
+      1.5811388300841898,
+      2.8117066259517456,
+      4.999999999999999,
+      8.891397050194612,
+      15.811388300841895,
+      28.11706625951745,
+      50.0
+    ]
+  },
+  "model": {
+    "omega_rad_s": 62831.853071795864,
+    "gamma_e_rad_s_T": 175929188601.0284,
+    "mass_kg": 1.470265361880023e-17,
+    "hbar_J_s": 1.054571817e-34,
+    "kT_to_T": 1000.0,
+    "eps_prob": 1e-09
+  },
+  "noise": {
+    "sigma_omega_rel": 0.0,
+    "trap_visibility_mode": "small_noise_avg",
+    "mfg_rel_noise_bound": 0.02,
+    "mfg_marginal_points": 5,
+    "T2_spin_s": null
+  },
+  "env_cfg": {
+    "episode_len": 32,
+    "n_g_grid": 1024
+  },
+  "planner_cfg": {
+    "objective": "variance_reduction",
+    "phase_mode": "analytic_quadrature",
+    "phase_grid_size": 181,
+    "robust_mfg_mode": "nominal",
+    "alias_halfwidth_max_rad": 1.75,
+    "alias_credible_mass": 0.9,
+    "cycle_penalty": 0.0,
+    "mfg_penalty": 0.0,
+    "min_visibility": 0.0
+  },
+  "adaptive_eval_episodes": 256,
+  "fixed_baseline_episodes": 64,
+  "run_fixed_baseline": true,
+  "fixed_baseline_adaptive_phase": true
+}

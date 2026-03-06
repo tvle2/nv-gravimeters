@@ -83,9 +83,15 @@ class ModelConfig:
     sigma_phi_drift: float = 0.03
     sigma_dt_drift: float = 0.0
 
-    # MFG amplitude noise: B' -> B'(1+eps), eps ~ N(0, sigma_B_rel)
-    sigma_B_rel: float = 0.0001
-    B_rel_clip: float = 0.5
+    # -------------------------
+    # Paper-faithful bounded MFG amplitude noise:
+    # B' -> B'(1 + eps), eps ~ Uniform(-Bp_rel_bound, +Bp_rel_bound)
+    # "restricted in 10% range" -> Bp_rel_bound = 0.10
+    # -------------------------
+    Bp_rel_bound: float = 0.10   # ±10% by default (paper-faithful)
+    Bp_rel_clip_min: float = 1e-9  # keep B' positive and nonzero
+    sigma_eps_drift: float = 0.0   # eps drift per step (0 => constant per episode)
+
 
     def y0_m(self) -> float:
         return float(np.sqrt(self.hbar_J_s / (2.0 * self.mass_kg * self.omega_rad_s)))
@@ -113,12 +119,18 @@ class ModelConfig:
         return float(2.0 * np.pi / max(k, 1e-30))
 
     def sample_Bp_effective_kTm(self, rng: np.random.Generator, Bp_kTm: float) -> float:
-        """Shot-to-shot multiplicative MFG noise (kept positive)."""
-        if self.sigma_B_rel <= 0.0:
+        """
+        Paper-faithful bounded multiplicative MFG noise:
+            eps ~ Uniform(-Bp_rel_bound, +Bp_rel_bound)
+            Bp_true = Bp * (1 + eps)
+        """
+        bound = float(getattr(self, "Bp_rel_bound", 0.0))
+        if bound <= 0.0:
             return float(Bp_kTm)
-        eps = float(rng.normal(0.0, self.sigma_B_rel))
-        eps = float(np.clip(eps, -self.B_rel_clip, self.B_rel_clip))
-        return float(max(1e-9, (1.0 + eps) * float(Bp_kTm)))
+
+        eps = float(rng.uniform(-bound, +bound))
+        Bp_true = (1.0 + eps) * float(Bp_kTm)
+        return float(max(self.Bp_rel_clip_min, Bp_true))
 
     def visibility_A(self, eta: float, dt_s: np.ndarray) -> np.ndarray:
         x = self.omega_rad_s * dt_s
@@ -198,6 +210,8 @@ class RBPFGravBelief:
         # particle log-weights
         self.logw_n = np.full(cfg.n_nuisance, -np.log(cfg.n_nuisance), dtype=np.float64)
 
+        self.eps = np.zeros(cfg.n_nuisance, dtype=np.float64)
+
         # conditional g log-weights per particle: shape [Nn, Ng]
         self.logw_g = np.full((cfg.n_nuisance, cfg.n_g_grid), -np.log(cfg.n_g_grid), dtype=np.float64)
 
@@ -221,6 +235,9 @@ class RBPFGravBelief:
         self.dt = self.rng.uniform(*self.prior.dt_range, size=self.cfg.n_nuisance)
         self.phi = self.rng.uniform(*self.prior.phi_range, size=self.cfg.n_nuisance)
 
+        b = float(getattr(self.model, "Bp_rel_bound", 0.0))
+        self.eps = self.rng.uniform(-b, +b, size=self.cfg.n_nuisance)  # NEW
+
         self.logw_n.fill(-np.log(self.cfg.n_nuisance))
         self.logw_g.fill(-np.log(self.cfg.n_g_grid))
 
@@ -228,6 +245,13 @@ class RBPFGravBelief:
         m = self.model
         if m.sigma_dt_drift > 0.0:
             self.dt = self.dt + self.rng.normal(0.0, m.sigma_dt_drift, size=self.cfg.n_nuisance)
+        
+        # eps drift (clip to bound)
+        if getattr(m, "sigma_eps_drift", 0.0) > 0.0:
+            b = float(getattr(m, "Bp_rel_bound", 0.0))
+            self.eps = self.eps + self.rng.normal(0.0, m.sigma_eps_drift, size=self.cfg.n_nuisance)
+            self.eps = np.clip(self.eps, -b, +b)
+
         self.phi = wrap_to_pi(self.phi + self.rng.normal(0.0, m.sigma_phi_drift, size=self.cfg.n_nuisance))
     
     def g_map(self) -> float:
@@ -292,11 +316,14 @@ class RBPFGravBelief:
         p = p / (np.sum(p) + 1e-300)
         return p.astype(np.float64)
 
-    # ---- phase-lock using mixture moment E[e^{i2(k g + phi)}] ----
     def _C2(self, T_s: float, Bp_kTm: float) -> complex:
         """
         Mixture moment used for phase-lock:
-            C2 = sum_i w_n(i) * exp(i*2*phi_i) * E_{p_i(g)}[exp(i*2*k*g)]
+            C2 = sum_i w_n(i) * exp(i*2*phi_i) * E_{p_i(g)}[exp(i*2*k_i*g)]
+
+        IMPORTANT: this version is EPS-AWARE:
+            k_i = k_nom(T,Bp_nom) * (1 + eps_i)
+        so phase-lock is consistent with the RBPF update model that uses eps_i particles.
         """
         # ----- nuisance weights wn (safe) -----
         logw_n = np.nan_to_num(self.logw_n, nan=-np.inf, posinf=-np.inf, neginf=-np.inf)
@@ -307,12 +334,13 @@ class RBPFGravBelief:
             wn = np.exp(logw_n - Z_n)
             wn = wn / (np.sum(wn) + 1e-300)
 
-        # ----- g-phase vector (bounded) -----
-        k = float(self.model.k_g(T_s, Bp_kTm))
-        if not np.isfinite(k):
+        # ----- nominal k and per-particle effective k_i (includes eps) -----
+        k_nom = float(self.model.k_g(T_s, Bp_kTm))
+        if (not np.isfinite(k_nom)) or (k_nom <= 0.0):
             return 0.0 + 0.0j
 
-        phase2 = np.exp(1j * np.remainder(2.0 * k * self.g_grid, 2.0 * np.pi))  # [Ng] complex128
+        eps_i = np.nan_to_num(self.eps, nan=0.0, posinf=0.0, neginf=0.0)  # [Nn]
+        k_i = k_nom * (1.0 + eps_i)  # [Nn]
 
         # ----- conditional g weights per nuisance particle (robust) -----
         logw_g = np.nan_to_num(self.logw_g, nan=-np.inf, posinf=-np.inf, neginf=-np.inf)  # [Nn,Ng]
@@ -321,13 +349,12 @@ class RBPFGravBelief:
         logw_g = np.minimum(logw_g, 0.0)
 
         # detect rows that are completely invalid (all -inf)
-        row_max = np.max(logw_g, axis=1)                # [Nn]
-        bad = ~np.isfinite(row_max)                     # True if row is all -inf (or all nan pre-sanitize)
+        row_max = np.max(logw_g, axis=1)  # [Nn]
+        bad = ~np.isfinite(row_max)
 
         # row-wise log-normalization: logw_g_norm = logw_g - logsumexp(logw_g)
-        row_Z = logsumexp_rowwise(logw_g)               # [Nn]
+        row_Z = logsumexp_rowwise(logw_g)  # [Nn]
         row_Z = np.nan_to_num(row_Z, nan=0.0, posinf=0.0, neginf=0.0)
-
         logw_g_norm = logw_g - row_Z[:, None]
 
         # for bad rows, force uniform
@@ -335,22 +362,24 @@ class RBPFGravBelief:
             logw_g_norm[bad, :] = -np.log(self.cfg.n_g_grid)
 
         # exponentiate -> weights
-        wg_i = np.exp(logw_g_norm)                      # [Nn,Ng] float64
+        wg_i = np.exp(logw_g_norm)  # [Nn,Ng] float64
 
         # final sanitize + renormalize rows (important!)
         wg_i = np.nan_to_num(wg_i, nan=0.0, posinf=0.0, neginf=0.0)
-
-        row_s = np.sum(wg_i, axis=1, keepdims=True)     # [Nn,1]
+        row_s = np.sum(wg_i, axis=1, keepdims=True)  # [Nn,1]
         zero_rows = (row_s[:, 0] <= 0.0) | (~np.isfinite(row_s[:, 0]))
         if np.any(zero_rows):
             wg_i[zero_rows, :] = 1.0 / self.cfg.n_g_grid
             row_s = np.sum(wg_i, axis=1, keepdims=True)
-
         wg_i = wg_i / (row_s + 1e-300)
 
-        # ----- per-particle expectation E_{p_i(g)}[phase2] -----
-        # using elementwise sum instead of BLAS matmul to avoid warnings
-        C2_g_i = np.sum(wg_i * phase2[None, :], axis=1)  # [Nn] complex128
+        # ----- EPS-AWARE phase2: exp(i * 2 * k_i * g_grid) per particle -----
+        # arg shape: [Nn,Ng]
+        arg = np.remainder(2.0 * k_i[:, None] * self.g_grid[None, :], 2.0 * np.pi)
+        phase2 = np.exp(1j * arg)  # [Nn,Ng] complex128
+
+        # per-particle expectation over g
+        C2_g_i = np.sum(wg_i * phase2, axis=1)  # [Nn] complex128
 
         # ----- include nuisance phase phi and mix over wn -----
         phi = np.nan_to_num(self.phi, nan=0.0, posinf=0.0, neginf=0.0)
@@ -374,40 +403,68 @@ class RBPFGravBelief:
     # ---- RBPF update ----
     def update(self, outcome_plus: int, T_s: float, Bp_kTm: float, varphi: float) -> None:
         """
+        RBPF update with nuisance particles (dt_i, phi_i, eps_i).
+
+        eps_i is the (slowly varying / episode-constant) multiplicative B' scale error:
+            Bp_eff_i = Bp_nominal * (1 + eps_i),   eps_i ∈ [-Bp_rel_bound, +Bp_rel_bound]
+
         For each particle i:
-          p_i(g) ∝ p_i(g) * like_i(g)
-          evidence Z_i = ∫ p_i(g) like_i(g) dg  (discrete sum)
+        p_i(g) ∝ p_i(g) * like_i(g)
+        evidence Z_i = ∫ p_i(g) like_i(g) dg
         Particle weights:
-          w_i ∝ w_i * Z_i
+        w_i ∝ w_i * Z_i
         """
         m = self.model
-        eps = m.eps_prob
+        eps_prob = float(m.eps_prob)
 
-        k = m.k_g(T_s, Bp_kTm)
-        phi_g = k * self.g_grid                                     # [Ng] rad
-        theta_g = np.remainder(phi_g, 2.0 * np.pi)                  # [Ng]
+        # --- per-particle effective B' (kT/m) ---
+        b = float(getattr(m, "Bp_rel_bound", 0.0))
+        Bp_min = float(getattr(m, "Bp_rel_clip_min", 1e-9))
 
-        eta = m.eta(Bp_kTm)
-        A_i = m.visibility_A(eta, self.dt)                          # [Nn]
-
-        # Marginalize shot-to-shot MFG amplitude noise as extra dephasing
-        if m.sigma_B_rel > 0.0:
-            deph = np.exp(-0.5 * (m.sigma_B_rel * phi_g) ** 2)      # [Ng]
-            A_ig = A_i[:, None] * deph[None, :]                     # [Nn,Ng]
+        if b > 0.0:
+            # eps particles already live in [-b, +b]
+            Bp_eff_kTm = (1.0 + self.eps) * float(Bp_kTm)  # [Nn]
+            Bp_eff_kTm = np.maximum(Bp_min, Bp_eff_kTm)
         else:
-            A_ig = A_i[:, None]
+            Bp_eff_kTm = np.full(self.cfg.n_nuisance, float(Bp_kTm), dtype=np.float64)
 
-        theta = theta_g[None, :] + self.phi[:, None] + float(varphi)
-        p_plus = 0.5 * (1.0 + A_ig * np.cos(theta))
-        p_plus = np.clip(p_plus, eps, 1.0 - eps)
+        # --- compute k_i(T, Bp_eff) and eta_i(Bp_eff) vectorized over nuisance particles ---
+        w = float(m.omega_rad_s)
+        gma = float(m.gamma_e_rad_s_T)
 
-        like = p_plus if outcome_plus == 1 else (1.0 - p_plus)
+        # convert to T/m
+        Bp_eff_Tpm = Bp_eff_kTm * float(m.kT_to_T)  # [Nn]
+
+        # k_g = (2γ/ω) B' T^2 + (8πγ/ω^3) B'
+        k_i = (2.0 * gma / w) * Bp_eff_Tpm * (T_s ** 2) + (8.0 * np.pi * gma / (w ** 3)) * Bp_eff_Tpm  # [Nn]
+
+        # phase vs g grid: phi_g[i,j] = k_i[i] * g_grid[j]
+        phi_g = k_i[:, None] * self.g_grid[None, :]  # [Nn, Ng]
+        theta_g = np.remainder(phi_g, 2.0 * np.pi)   # [Nn, Ng]
+
+        # eta(B') = γ B' y0 / ω
+        y0 = float(m.y0_m())
+        eta_i = gma * Bp_eff_Tpm * y0 / w  # [Nn]
+
+        # visibility A_i(dt_i, eta_i) using S65
+        x = w * self.dt  # [Nn]
+        f = 16.0 * eta_i * np.cos(x / 4.0) * (np.sin(3.0 * x / 4.0) ** 2)  # [Nn]
+        A_i = np.exp(-(f ** 2) / 2.0)  # [Nn]
+
+        # full theta for each particle and g-grid
+        theta = theta_g + self.phi[:, None] + float(varphi)  # [Nn, Ng]
+
+        # likelihood for + outcome
+        p_plus = 0.5 * (1.0 + A_i[:, None] * np.cos(theta))
+        p_plus = np.clip(p_plus, eps_prob, 1.0 - eps_prob)
+
+        like = p_plus if int(outcome_plus) == 1 else (1.0 - p_plus)
         log_like = np.log(like + 1e-300)
 
-        # per-particle evidence in log-space
+        # per-particle evidence
         logZ = logsumexp_rowwise(self.logw_g + log_like)  # [Nn]
 
-        # update conditional g posteriors and renormalize per particle
+        # update conditional g posteriors (normalize per particle)
         self.logw_g = self.logw_g + log_like - logZ[:, None]
 
         # update particle weights
@@ -420,9 +477,11 @@ class RBPFGravBelief:
             idx = systematic_resample(wn, self.rng)
             self.dt = self.dt[idx]
             self.phi = self.phi[idx]
+            self.eps = self.eps[idx]              # IMPORTANT: resample eps too
             self.logw_g = self.logw_g[idx, :]
             self.logw_n.fill(-np.log(self.cfg.n_nuisance))
-        # ---- numerical safety guard (put this at the very end) ----
+
+        # numerical safety
         if (not np.isfinite(self.logw_g).all()) or (not np.isfinite(self.logw_n).all()):
             self.reset()
 
@@ -435,6 +494,11 @@ class RBPFGravBelief:
         mu_dt = float(np.sum(wn * self.dt))
         var_dt = float(np.sum(wn * (self.dt - mu_dt) ** 2))
 
+        # NEW eps stats
+        mu_eps = float(np.sum(wn * self.eps))
+        var_eps = float(np.sum(wn * (self.eps - mu_eps) ** 2))
+
+
         c = float(np.sum(wn * np.cos(self.phi)))
         s = float(np.sum(wn * np.sin(self.phi)))
         mu_phi = float(np.arctan2(s, c))
@@ -443,6 +507,7 @@ class RBPFGravBelief:
         return {
             "mu_g": mu_g, "std_g": float(np.sqrt(max(var_g, 0.0))),
             "mu_dt": mu_dt, "std_dt": float(np.sqrt(max(var_dt, 0.0))),
+            "mu_eps": mu_eps, "std_eps": float(np.sqrt(max(var_eps, 0.0))),
             "mu_phi": mu_phi, "R_phi": R_phi,
         }
 
@@ -456,6 +521,7 @@ class GravimeterEnvPaperRBPF:
       [ hist_g (bins),
         mu_g, std_g,
         mu_dt, std_dt,
+        mu_eps, std_eps,
         cos(mu_phi), sin(mu_phi), R_phi,
         progress,
         probe_now ]
@@ -493,7 +559,7 @@ class GravimeterEnvPaperRBPF:
 
     @property
     def obs_dim(self) -> int:
-        return int(self.cfg.g_hist_bins) + 12
+        return int(self.cfg.g_hist_bins) + 14
 
     def _is_probe_now(self) -> bool:
         return (self.cfg.probe_every > 0) and ((self.k % self.cfg.probe_every) == 0) and (self.k > 0)
@@ -502,11 +568,18 @@ class GravimeterEnvPaperRBPF:
         self.true_g = float(self.rng.uniform(*self.prior.g_range))
         self.true_dt = float(self.rng.uniform(*self.prior.dt_range))
         self.true_phi = float(self.rng.uniform(*self.prior.phi_range))
+        
+        b = float(getattr(self.model, "Bp_rel_bound", 0.0))
+        self.true_eps = float(self.rng.uniform(-b, +b))
 
     def _true_drift(self) -> None:
         m = self.model
         if m.sigma_dt_drift > 0.0:
             self.true_dt = float(self.true_dt + self.rng.normal(0.0, m.sigma_dt_drift))
+        if getattr(m, "sigma_eps_drift", 0.0) > 0.0:
+            b = float(getattr(m, "Bp_rel_bound", 0.0))
+            self.true_eps = float(self.true_eps + self.rng.normal(0.0, m.sigma_eps_drift))
+            self.true_eps = float(np.clip(self.true_eps, -b, +b))
         self.true_phi = float(wrap_to_pi(np.array([self.true_phi + self.rng.normal(0.0, m.sigma_phi_drift)]))[0])
 
     def _features(self) -> np.ndarray:
@@ -546,6 +619,7 @@ class GravimeterEnvPaperRBPF:
                         p1, gap, ent_g,
                         st["mu_g"], st["std_g"],
                         st["mu_dt"], st["std_dt"],
+                        st["mu_eps"], st["std_eps"],
                         np.cos(mu_phi), np.sin(mu_phi), st["R_phi"],
                         self.k / max(1, (self.cfg.episode_len - 1)),
                         probe,
@@ -593,7 +667,7 @@ class GravimeterEnvPaperRBPF:
         varphi = self.belief.phase_lock_quadrature(T_s, Bp_kTm)
 
         # true shot uses noisy applied gradient
-        Bp_true_kTm = self.model.sample_Bp_effective_kTm(self.rng, Bp_kTm)
+        Bp_true_kTm = float(max(self.model.Bp_rel_clip_min, (1.0 + self.true_eps) * Bp_kTm))
 
         # true visibility per S65
         eta = self.model.eta(Bp_true_kTm)
@@ -625,9 +699,8 @@ class GravimeterEnvPaperRBPF:
         r_g = 0.5 * (np.log(self._prev_var_g + eps) - np.log(var_g + eps))
         self._prev_var_g = var_g
 
-        # reward = float(r_g)
-        # use entropy reduction as the main signal (alias-aware)
-        reward = float(r_ent)
+        # Use variance reduction in g as the reward (aligns with RMSE goal)
+        reward = float(r_g)
 
         if probe_now and self.cfg.lambda_dt > 0.0:
             r_dt = 0.5 * (np.log(self._prev_var_dt + eps) - np.log(var_dt + eps))
@@ -656,6 +729,7 @@ class GravimeterEnvPaperRBPF:
             "outcome_plus": outcome_plus,
             "true_g": self.true_g,
             "true_dt": self.true_dt,
+            "true_eps": float(self.true_eps),
             "true_phi": self.true_phi,
             "A_true": A_true,
             "post_mu_g": st["mu_g"],
@@ -664,9 +738,12 @@ class GravimeterEnvPaperRBPF:
             "post_std_dt": st["std_dt"],
             "post_mu_phi": st["mu_phi"],
             "post_R_phi": st["R_phi"],
+            "post_mu_eps": float(st["mu_eps"]),
+            "post_std_eps": float(st["std_eps"]),
             "probe_now": probe_now,
             "r_g": float(r_g),
             "k_g_nom": k_g_nom,
-            "dg2pi_nom": dg2pi_nom
+            "dg2pi_nom": dg2pi_nom,
+
         }
         return obs, float(reward), bool(done), info

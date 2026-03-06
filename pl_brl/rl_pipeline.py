@@ -85,6 +85,9 @@ class ActorCriticMasked(nn.Module):
         dg2pi_flat: torch.Tensor,
         kg_flat: torch.Tensor,
         std_g_index: int,
+        mu_g_index: int,          
+        mu_eps_index: int,
+        std_eps_index: int,
         probe_index: int,
         alias_sigma_mult: float,
         alias_frac: float,
@@ -108,6 +111,10 @@ class ActorCriticMasked(nn.Module):
         self.alias_frac = float(alias_frac)
         self.theta_probe_max = float(theta_probe_max)
 
+        self.mu_g_index = int(mu_g_index)
+        self.mu_eps_index = int(mu_eps_index)
+        self.std_eps_index = int(std_eps_index)
+
         self.wrap_max = float(wrap_max)
         self.sigma_theta_max = float(2.0 * np.pi * self.wrap_max)
         
@@ -126,11 +133,19 @@ class ActorCriticMasked(nn.Module):
 
     def _compute_mask(self, obs_raw: torch.Tensor) -> torch.Tensor:
         assert self._mask_ready, "Call set_action_masking(...) first."
+
         std_g = obs_raw[:, self.std_g_index].clamp_min(0.0)
+        mu_g  = obs_raw[:, self.mu_g_index]
+
+        mu_eps  = obs_raw[:, self.mu_eps_index]
+        std_eps = obs_raw[:, self.std_eps_index].clamp_min(0.0)
+
+        # Effective uncertainty in (1+eps)*g
+        std_eff = torch.sqrt(((1.0 + mu_eps) * std_g) ** 2 + (mu_g * std_eps) ** 2 + 1e-12)
 
         kg = self.kg_flat.unsqueeze(0)
         m = self.alias_sigma_mult
-        sigma_theta = m * std_g.unsqueeze(1) * kg
+        sigma_theta = m * std_eff.unsqueeze(1) * kg
 
         mask = sigma_theta <= self.sigma_theta_max
 
@@ -175,7 +190,97 @@ class ActorCriticMasked(nn.Module):
 
 
 # ----------------------------- dataset (expert) -----------------------------
+# def expert_scores(env, obs: np.ndarray) -> np.ndarray:
+#     if getattr(env.cfg, "probe_every", 0) != 0:
+#         raise RuntimeError("expert_scores(): expected probe_every=0")
+#     if getattr(env.cfg, "lambda_dt", 0.0) != 0.0:
+#         raise RuntimeError("expert_scores(): expected lambda_dt=0")
+
+#     st = env.belief.stats()
+#     stdg = max(float(st["std_g"]), 1e-12)
+#     mu_g = float(st["mu_g"])
+
+#     mu_eps  = float(st.get("mu_eps", 0.0))
+#     std_eps = max(float(st.get("std_eps", 0.0)), 1e-12)
+
+#     # Effective uncertainty in q = (1+eps)*g
+#     std_eff = float(np.sqrt(((1.0 + mu_eps) * stdg) ** 2 + (mu_g * std_eps) ** 2))
+#     std_eff = max(std_eff, 1e-12)
+
+#     nT, nB = env.nT, env.nB
+#     scores = np.full((nT, nB), -np.inf, dtype=np.float64)
+
+#     m = float(env.cfg.alias_sigma_mult)
+
+#     wrap_max = float(env.cfg.wrap_max)
+#     sigma_theta_max = 2.0 * np.pi * wrap_max
+
+#     # --- key knobs (these matter) ---
+#     theta_target = 1.0     # rad: desired sigma_theta per step (try 0.7–1.5)
+#     beta = 0.5             # how hard to enforce k≈k_star (try 0.2–2.0)
+#     lam_edge = 0.2         # penalty near boundary (try 0.05–0.5)
+#     margin = 0.85          # safety margin vs hard edge (try 0.7–0.9)
+
+#     sigma_theta_safe = sigma_theta_max * margin
+
+#     # target k and cap by safe boundary
+#     k_target = theta_target / (m * std_eff)
+#     k_cap = sigma_theta_safe / (m * std_eff)
+#     k_star = min(k_target, k_cap)
+
+#     wn = env.belief.w_n
+#     dt = env.belief.dt
+#     eps = env.belief.eps
+
+#     Bp_eff = (1.0 + eps) * Bp
+#     Bp_eff = np.maximum(env.model.Bp_rel_clip_min, Bp_eff)
+
+#     for i in range(nT):
+#         T_s = float(env.grid.T_vals_s[i])
+#         for j in range(nB):
+#             Bp = float(env.grid.Bp_vals_kTm[j])
+
+#             k = float(env.model.k_g(T_s, Bp))
+#             if not np.isfinite(k) or k <= 0.0:
+#                 continue
+
+#             sigma_theta = m * std_eff * k
+
+#             if sigma_theta > sigma_theta_safe:
+#                 continue  # hard gate with margin
+
+#             # Visibility mixture under dt particles
+#             eta = env.model.eta(Bp)
+#             A_part = env.model.visibility_A(eta, env.belief.dt)
+#             A_eff = float(np.sum(env.belief.w_n * A_part))
+
+        
+#             base = (A_eff ** 2) * (k_star ** 2)
+
+#             # penalize deviating from k_star (log is scale-invariant)
+#             log_ratio = np.log(max(k, 1e-12) / max(k_star, 1e-12))
+#             pen_k = beta * (log_ratio ** 2)
+
+#             # penalize operating close to the safe edge
+#             edge = sigma_theta / max(sigma_theta_safe, 1e-12)
+#             pen_edge = lam_edge * (edge ** 4)
+
+#             scores[i, j] = base - pen_k - pen_edge
+
+#     return scores
+
 def expert_scores(env, obs: np.ndarray) -> np.ndarray:
+    """
+    Physics-consistent expert scoring for action (T,B') selection.
+
+    Key properties:
+      - Uses std_eff = uncertainty in q=(1+eps)*g (matches policy mask)
+      - Uses EPS-AWARE visibility mixture A_eff over nuisance particles (dt_i, eps_i)
+      - Targets sigma_theta ~= theta_target with safety margin vs alias boundary
+
+    Returns:
+      scores[nT,nB] (float64), -inf for invalid/unsafe actions.
+    """
     if getattr(env.cfg, "probe_every", 0) != 0:
         raise RuntimeError("expert_scores(): expected probe_every=0")
     if getattr(env.cfg, "lambda_dt", 0.0) != 0.0:
@@ -185,59 +290,84 @@ def expert_scores(env, obs: np.ndarray) -> np.ndarray:
     stdg = max(float(st["std_g"]), 1e-12)
     mu_g = float(st["mu_g"])
 
+    # --- EPS-aware effective uncertainty in q=(1+eps)*g ---
+    mu_eps = float(st.get("mu_eps", 0.0))
+    std_eps = max(float(st.get("std_eps", 0.0)), 1e-12)
+
+    std_eff = float(np.sqrt(((1.0 + mu_eps) * stdg) ** 2 + (mu_g * std_eps) ** 2))
+    std_eff = max(std_eff, 1e-12)
+
     nT, nB = env.nT, env.nB
     scores = np.full((nT, nB), -np.inf, dtype=np.float64)
 
+    # --- alias/safety ---
     m = float(env.cfg.alias_sigma_mult)
-
     wrap_max = float(env.cfg.wrap_max)
     sigma_theta_max = 2.0 * np.pi * wrap_max
 
-    # --- key knobs (these matter) ---
-    theta_target = 1.0     # rad: desired sigma_theta per step (try 0.7–1.5)
-    beta = 0.5             # how hard to enforce k≈k_star (try 0.2–2.0)
-    lam_edge = 0.2         # penalty near boundary (try 0.05–0.5)
-    margin = 0.85          # safety margin vs hard edge (try 0.7–0.9)
+    # --- scoring knobs ---
+    theta_target = 1.0   # desired sigma_theta per step (rad)
+    beta = 0.5           # penalty strength for deviating from k_star
+    lam_edge = 0.2       # penalty for operating close to the safe edge
+    margin = 0.85        # safety margin vs hard alias edge
 
     sigma_theta_safe = sigma_theta_max * margin
 
-    # target k and cap by safe boundary
-    k_target = theta_target / (m * stdg)
-    k_cap = sigma_theta_safe / (m * stdg)
+    # Target k based on desired per-step phase uncertainty
+    k_target = theta_target / (m * std_eff)
+    k_cap = sigma_theta_safe / (m * std_eff)
     k_star = min(k_target, k_cap)
+
+    # --- nuisance particles (for EPS-aware A_eff) ---
+    wn = env.belief.w_n.astype(np.float64)
+    dt = env.belief.dt.astype(np.float64)
+    eps = env.belief.eps.astype(np.float64)
+
+    # model constants for eta
+    model = env.model
+    w = float(model.omega_rad_s)
+    gma = float(model.gamma_e_rad_s_T)
+    y0 = float(model.y0_m())
+    kT_to_T = float(model.kT_to_T)
+    Bp_min = float(getattr(model, "Bp_rel_clip_min", 1e-9))
 
     for i in range(nT):
         T_s = float(env.grid.T_vals_s[i])
         for j in range(nB):
             Bp = float(env.grid.Bp_vals_kTm[j])
 
-            k = float(env.model.k_g(T_s, Bp))
-            if not np.isfinite(k) or k <= 0.0:
+            k = float(model.k_g(T_s, Bp))
+            if (not np.isfinite(k)) or (k <= 0.0):
                 continue
 
-            sigma_theta = m * stdg * k
+            sigma_theta = m * std_eff * k
             if sigma_theta > sigma_theta_safe:
-                continue  # hard gate with margin
+                continue  # hard gate (with margin)
 
-            # Visibility mixture under dt particles
-            eta = env.model.eta(Bp)
-            A_part = env.model.visibility_A(eta, env.belief.dt)
-            A_eff = float(np.sum(env.belief.w_n * A_part))
+            # ---------------- EPS-AWARE visibility mixture ----------------
+            # Bp_eff_i = (1+eps_i)*Bp, then eta_i(Bp_eff_i), then A_i(dt_i,eta_i)
+            Bp_eff = (1.0 + eps) * Bp
+            Bp_eff = np.maximum(Bp_min, Bp_eff)
 
-            # MFG amplitude noise proxy dephasing
-            if float(env.model.sigma_B_rel) > 0.0:
-                phi_nom = float(env.model.delta_phi_scalar(mu_g, T_s, Bp))
-                A_eff *= float(np.exp(-0.5 * (float(env.model.sigma_B_rel) * phi_nom) ** 2))
+            # eta_i = gamma * (Bp_eff_Tpm) * y0 / omega
+            Bp_eff_Tpm = Bp_eff * kT_to_T
+            eta_i = gma * Bp_eff_Tpm * y0 / w  # [Nn]
 
-            # Encourage informative but controlled k:
-            # base info at k_star (NOT k)
+            x = w * dt
+            f = 16.0 * eta_i * np.cos(x / 4.0) * (np.sin(3.0 * x / 4.0) ** 2)
+            A_i = np.exp(-(f ** 2) / 2.0)
+
+            A_eff = float(np.sum(wn * A_i))
+            # ----------------------------------------------------------------
+
+            # Base score: prefer high visibility and a k near k_star
             base = (A_eff ** 2) * (k_star ** 2)
 
-            # penalize deviating from k_star (log is scale-invariant)
+            # Penalize deviating from k_star (scale-invariant)
             log_ratio = np.log(max(k, 1e-12) / max(k_star, 1e-12))
             pen_k = beta * (log_ratio ** 2)
 
-            # penalize operating close to the safe edge
+            # Penalize operating near boundary
             edge = sigma_theta / max(sigma_theta_safe, 1e-12)
             pen_edge = lam_edge * (edge ** 4)
 
@@ -833,6 +963,13 @@ def evaluate_policy(
                     )
                 print(f"  A_mean={A_mean:.3f} | A_min={A_min:.3f} | frac(A<{A_low_thresh})={A_frac_low:.3f}")
                 print(f"  overconf_cat={is_overconf_cat} (std_g<{overconf_std_g_max})")
+
+                eps_true = float(last.get("true_eps", np.nan))
+                eps_hat  = float(last.get("post_mu_eps", np.nan))
+                eps_err  = eps_hat - eps_true
+                print(f"  |err_map|={abs(err_map):.6f}  vs  9.8*|eps_err|≈{abs(eps_err)*9.8:.6f}")
+                print(f"  eps_true={eps_true:+.5f} | eps_hat={eps_hat:+.5f} | eps_err={eps_err:+.5f} | approx|Δg|≈{abs(eps_err)*9.8:.4f}")
+                print(f"  post_std_eps={float(last.get('post_std_eps', np.nan)):.6f}")
 
         if is_overconf_cat:
             overconf_cat_count += 1

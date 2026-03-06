@@ -1,0 +1,67 @@
+=== Configuration summary ===
+seed=0
+g range: (9.7639, 9.8337)
+grid: n_T=9, n_B=9, n_actions=81
+T range [s]: 5.000e-05 .. 1.000e-03
+B' range [kT/m]: 0.500 .. 50.000
+episode_len=32, n_g_grid=1024
+noise: sigma_omega_rel=0.0, trap_mode=small_noise_avg, mfg_rel_bound=0.0, T2=None
+planner: objective=variance_reduction, phase_mode=analytic_quadrature, robust_mfg_mode=nominal, alias_halfwidth_max_rad=1.75, alias_credible_mass=0.9
+
+=== Adaptive controller first action ===
+{
+  "aT": 0,
+  "aB": 2,
+  "T_s": 5e-05,
+  "Bp_kTm": 1.5811388300841898,
+  "mw_phase_rad": -1.4193288672934692,
+  "visibility_A": 1.0,
+  "score": 0.00021915936882521692,
+  "delta_g_2pi": 0.12486382250393867
+}
+
+=== Adaptive controller evaluation ===
+[Adaptive Eval] episode 32/256 | rmse_mean=2.659755e-05 | rmse_map=4.790019e-05 | mean_std=3.536267e-04 | cat_med=0
+[Adaptive Eval] episode 64/256 | rmse_mean=4.762945e-05 | rmse_map=4.020961e-05 | mean_std=4.217539e-04 | cat_med=0
+[Adaptive Eval] episode 96/256 | rmse_mean=4.372021e-05 | rmse_map=3.947023e-05 | mean_std=4.065548e-04 | cat_med=0
+[Adaptive Eval] episode 128/256 | rmse_mean=1.132793e-04 | rmse_map=4.607371e-05 | mean_std=4.334971e-04 | cat_med=0
+[Adaptive Eval] episode 160/256 | rmse_mean=1.023704e-04 | rmse_map=4.436252e-05 | mean_std=4.115991e-04 | cat_med=0
+[Adaptive Eval] episode 192/256 | rmse_mean=9.570293e-05 | rmse_map=4.145860e-05 | mean_std=4.078195e-04 | cat_med=0
+[Adaptive Eval] episode 224/256 | rmse_mean=8.955811e-05 | rmse_map=4.018528e-05 | mean_std=4.008928e-04 | cat_med=0
+[Adaptive Eval] episode 256/256 | rmse_mean=8.636040e-05 | rmse_map=3.890868e-05 | mean_std=4.157461e-04 | cat_med=0
+{
+  "rmse_g_mean": 8.636039973770066e-05,
+  "rmse_g_median": 4.870606135435052e-05,
+  "rmse_g_map": 3.890868272409207e-05,
+  "mean_post_std_g": 0.0004157460986982575,
+  "mean_entropy_g": 0.4382381435432049,
+  "mean_cycle_time_s_last_shot": 0.0014922122481166957
+}
+
+=== Fixed-(T,B') baseline action ===
+{
+  "aT": 0,
+  "aB": 2,
+  "T_s": 5e-05,
+  "Bp_kTm": 1.5811388300841898,
+  "delta_g_2pi": 0.12486382250393867,
+  "adaptive_phase": true
+}
+
+=== Fixed-(T,B') baseline evaluation ===
+[Fixed Eval] episode 8/64 | rmse_mean=3.308655e-03 | rmse_map=3.297373e-03 | mean_std=3.506452e-03 | cat_med=8
+[Fixed Eval] episode 16/64 | rmse_mean=3.446751e-03 | rmse_map=3.669996e-03 | mean_std=3.361537e-03 | cat_med=16
+[Fixed Eval] episode 24/64 | rmse_mean=3.831793e-03 | rmse_map=3.987645e-03 | mean_std=3.395508e-03 | cat_med=23
+[Fixed Eval] episode 32/64 | rmse_mean=3.589719e-03 | rmse_map=3.693747e-03 | mean_std=3.400403e-03 | cat_med=31
+[Fixed Eval] episode 40/64 | rmse_mean=3.403825e-03 | rmse_map=3.469897e-03 | mean_std=3.340171e-03 | cat_med=37
+[Fixed Eval] episode 48/64 | rmse_mean=3.465201e-03 | rmse_map=3.523173e-03 | mean_std=3.360793e-03 | cat_med=44
+[Fixed Eval] episode 56/64 | rmse_mean=3.386866e-03 | rmse_map=3.465071e-03 | mean_std=3.348261e-03 | cat_med=50
+[Fixed Eval] episode 64/64 | rmse_mean=3.461789e-03 | rmse_map=3.531268e-03 | mean_std=3.371076e-03 | cat_med=56
+{
+  "rmse_g_mean": 0.003461788755794167,
+  "rmse_g_median": 0.003468709877428475,
+  "rmse_g_map": 0.0035312682010465424,
+  "mean_post_std_g": 0.0033710759674495565,
+  "mean_entropy_g": 5.28669600572305,
+  "mean_cycle_time_s_last_shot": 0.00044999999999999993
+}
