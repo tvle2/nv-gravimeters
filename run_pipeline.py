@@ -1,10 +1,11 @@
-# run_pipeline.py
 from __future__ import annotations
 
 import json
 import math
 import os
 from dataclasses import asdict
+
+import numpy as np
 
 from environment import (
     ActionGrid,
@@ -30,8 +31,8 @@ from adaptive_pipeline import (
 # USER CONFIG: edit this block only
 # ============================================================
 
-SEED = 0
-OUTPUT_DIR = "outputs_bayesian_adaptive"
+SEED = 42
+OUTPUT_DIR = "outputs_global_eps_hierarchical"
 
 # ---- Prior over gravity ----
 PRIOR = PriorConfig(
@@ -39,11 +40,6 @@ PRIOR = PriorConfig(
 )
 
 # ---- Action grid ----
-# Debug example:
-#   n_T=9, n_B=9, n_g_grid=256, episode_len=32
-#
-# Full example:
-#   n_T=21, n_B=21, n_g_grid=1024, episode_len=64
 GRID: ActionGrid = make_paper_scale_grid(
     n_T=9,
     n_B=9,
@@ -65,17 +61,9 @@ MODEL = GravimeterModel(
     mass_kg=mass_from_radius(100e-9),
 )
 
-# ---- Noise model ----
-# paper-faithful clean baseline:
-#   sigma_omega_rel=0.0
-#   trap_visibility_mode="small_noise_avg"
-#   mfg_rel_noise_bound=0.0
-#
-# mild robustness example:
-#   sigma_omega_rel=0.002
-#   trap_visibility_mode="small_noise_avg"
-#   mfg_rel_noise_bound=0.02
-
+# ---- Noise / global epsilon support ----
+# In this version:
+#   mfg_rel_noise_bound is the support of the stable unknown global bias epsilon.
 NOISE = NoiseConfig(
     sigma_omega_rel=0.0,
     trap_visibility_mode="small_noise_avg",
@@ -86,44 +74,43 @@ NOISE = NoiseConfig(
 # ---- Environment ----
 ENV_CFG = EnvConfig(
     episode_len=32,
-    n_g_grid=1024,
+    n_g_grid=512,
+    n_eps_grid=31,
 )
 
-# ---- Planner / adaptive controller ----
-# ---- Planner / adaptive controller ----
+# ---- Planner ----
 PLANNER_CFG = PlannerConfig(
     objective="variance_reduction",
     phase_mode="analytic_quadrature",
     phase_grid_size=181,
     robust_mfg_mode="nominal",
-
-    # Credible-width alias gate:
-    # reject if k_max * h90 > alias_halfwidth_max_rad
     alias_halfwidth_max_rad=1.75,
     alias_credible_mass=0.90,
-
     cycle_penalty=0.0,
     mfg_penalty=0.0,
     min_visibility=0.0,
 )
 
 # ---- Evaluation ----
-ADAPTIVE_EVAL_EPISODES = 256
-ADAPTIVE_EVAL_LOG_EVERY = 32
+ADAPTIVE_EVAL_EPISODES = 512
+ADAPTIVE_EVAL_LOG_EVERY = 8
+
+RUN_FIXED_BASELINE = True
+FIXED_BASELINE_EPISODES = 32
+FIXED_BASELINE_LOG_EVERY = 8
+FIXED_BASELINE_ADAPTIVE_PHASE = True
 
 # ---- Catastrophic diagnostics ----
 CATASTROPHIC_ABS_ERR_THRESHOLD = 5e-4
 CATASTROPHIC_LOG_TOP_K = 5
 SAVE_CATASTROPHIC_RECORDS = True
 
-# Fixed-action baseline for comparison
-RUN_FIXED_BASELINE = True
-FIXED_BASELINE_EPISODES = 64
-FIXED_BASELINE_LOG_EVERY = 8
-FIXED_BASELINE_ADAPTIVE_PHASE = True
-
-# Save a full step-by-step trace for the first adaptive episode
+# ---- Trace saving ----
 SAVE_FIRST_TRACE = True
+
+# ---- Global true epsilon for this whole run ----
+# same hardware calibration offset persists across ALL episodes
+GLOBAL_EPS_SEED = SEED + 12345
 
 
 # ============================================================
@@ -151,6 +138,14 @@ def build_controller() -> AdaptiveBayesController:
     )
 
 
+def sample_global_true_eps() -> float:
+    b = float(max(NOISE.mfg_rel_noise_bound, 0.0))
+    if b <= 0.0:
+        return 0.0
+    rng = np.random.default_rng(GLOBAL_EPS_SEED)
+    return float(rng.uniform(-b, +b))
+
+
 # ============================================================
 # Main
 # ============================================================
@@ -161,6 +156,7 @@ def main() -> None:
     MODEL.validate()
 
     controller = build_controller()
+    global_true_eps = sample_global_true_eps()
 
     print("=== Configuration summary ===")
     print(f"seed={SEED}")
@@ -168,7 +164,7 @@ def main() -> None:
     print(f"grid: n_T={GRID.nT}, n_B={GRID.nB}, n_actions={GRID.n_actions}")
     print(f"T range [s]: {GRID.T_vals_s[0]:.3e} .. {GRID.T_vals_s[-1]:.3e}")
     print(f"B' range [kT/m]: {GRID.Bp_vals_kTm[0]:.3f} .. {GRID.Bp_vals_kTm[-1]:.3f}")
-    print(f"episode_len={ENV_CFG.episode_len}, n_g_grid={ENV_CFG.n_g_grid}")
+    print(f"episode_len={ENV_CFG.episode_len}, n_g_grid={ENV_CFG.n_g_grid}, n_eps_grid={ENV_CFG.n_eps_grid}")
     print(
         "noise: "
         f"sigma_omega_rel={NOISE.sigma_omega_rel}, "
@@ -184,30 +180,50 @@ def main() -> None:
         f"alias_halfwidth_max_rad={PLANNER_CFG.alias_halfwidth_max_rad}, "
         f"alias_credible_mass={PLANNER_CFG.alias_credible_mass}"
     )
+    print(f"global_true_eps_for_this_run={global_true_eps:+.6f}")
 
     print("\n=== Adaptive controller first action ===")
-    first_action = summarize_first_action(PRIOR, controller, ENV_CFG.n_g_grid)
+    first_action = summarize_first_action(
+        prior=PRIOR,
+        noise=NOISE,
+        controller=controller,
+        n_g_grid=ENV_CFG.n_g_grid,
+        n_eps_grid=ENV_CFG.n_eps_grid,
+    )
     print(json.dumps(first_action, indent=2))
 
     print("\n=== Adaptive controller evaluation ===")
     adaptive_metrics, adaptive_trace, adaptive_catastrophics = evaluate_adaptive_controller(
         env_ctor=build_env,
+        prior=PRIOR,
+        noise=NOISE,
         controller=controller,
+        n_g_grid=ENV_CFG.n_g_grid,
+        n_eps_grid=ENV_CFG.n_eps_grid,
         episodes=ADAPTIVE_EVAL_EPISODES,
         log_every=ADAPTIVE_EVAL_LOG_EVERY,
         return_first_trace=SAVE_FIRST_TRACE,
         catastrophic_abs_err_threshold=CATASTROPHIC_ABS_ERR_THRESHOLD,
         catastrophic_log_top_k=CATASTROPHIC_LOG_TOP_K,
         save_catastrophic_records=SAVE_CATASTROPHIC_RECORDS,
+        global_true_eps=global_true_eps,
+        global_eps_seed=GLOBAL_EPS_SEED,
     )
     print(json.dumps(adaptive_metrics, indent=2))
 
     fixed_baseline_metrics = None
     fixed_baseline_trace = None
     fixed_action_summary = None
+    fixed_catastrophics = []
 
     if RUN_FIXED_BASELINE:
-        fixed_aT, fixed_aB = choose_reference_fixed_action(PRIOR, controller, ENV_CFG.n_g_grid)
+        fixed_aT, fixed_aB = choose_reference_fixed_action(
+            prior=PRIOR,
+            noise=NOISE,
+            controller=controller,
+            n_g_grid=ENV_CFG.n_g_grid,
+            n_eps_grid=ENV_CFG.n_eps_grid,
+        )
         fixed_T_s = float(GRID.T_vals_s[fixed_aT])
         fixed_B_kTm = float(GRID.Bp_vals_kTm[fixed_aB])
 
@@ -226,7 +242,11 @@ def main() -> None:
         print("\n=== Fixed-(T,B') baseline evaluation ===")
         fixed_baseline_metrics, fixed_baseline_trace, fixed_catastrophics = evaluate_fixed_action_baseline(
             env_ctor=build_env,
+            prior=PRIOR,
+            noise=NOISE,
             controller=controller,
+            n_g_grid=ENV_CFG.n_g_grid,
+            n_eps_grid=ENV_CFG.n_eps_grid,
             fixed_aT=fixed_aT,
             fixed_aB=fixed_aB,
             episodes=FIXED_BASELINE_EPISODES,
@@ -237,12 +257,13 @@ def main() -> None:
             catastrophic_abs_err_threshold=CATASTROPHIC_ABS_ERR_THRESHOLD,
             catastrophic_log_top_k=CATASTROPHIC_LOG_TOP_K,
             save_catastrophic_records=SAVE_CATASTROPHIC_RECORDS,
+            global_true_eps=global_true_eps,
+            global_eps_seed=GLOBAL_EPS_SEED,
         )
         print(json.dumps(fixed_baseline_metrics, indent=2))
 
-    # ---------------- save outputs ----------------
-
     metrics_summary = {
+        "global_true_eps": float(global_true_eps),
         "adaptive_first_action": first_action,
         "adaptive_metrics": adaptive_metrics,
         "adaptive_catastrophic_count": int(len(adaptive_catastrophics)),
@@ -253,6 +274,7 @@ def main() -> None:
 
     run_config = {
         "seed": SEED,
+        "global_eps_seed": GLOBAL_EPS_SEED,
         "prior": asdict(PRIOR),
         "grid": {
             "n_T": GRID.nT,
@@ -287,6 +309,7 @@ def main() -> None:
                 os.path.join(OUTPUT_DIR, "fixed_catastrophic_records.json"),
                 {"records": fixed_catastrophics},
             )
+
     save_json(os.path.join(OUTPUT_DIR, "metrics_summary.json"), metrics_summary)
     save_json(os.path.join(OUTPUT_DIR, "run_config.json"), run_config)
 

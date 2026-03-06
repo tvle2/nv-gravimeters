@@ -1,0 +1,61 @@
+{
+  "global_true_eps": 0.0014769195730640128,
+  "adaptive_first_action": {
+    "aT": 1,
+    "aB": 0,
+    "T_s": 7.271077167244768e-05,
+    "Bp_kTm": 0.5,
+    "mw_phase_rad": -1.4785745214523232,
+    "visibility_A": 1.0,
+    "score": 3.5244326994643416e-06,
+    "delta_g_2pi": 0.2649358473722507
+  },
+  "adaptive_metrics": {
+    "rmse_g_mean": 0.0016111501637228608,
+    "rmse_g_median": 0.0014821754989164343,
+    "rmse_g_map": 0.00228335636790325,
+    "mean_post_std_g": 0.000780007021110898,
+    "mean_post_std_eps": 3.0455348924465414e-05,
+    "mean_entropy_g": 0.4908735317589915,
+    "mean_entropy_joint": 0.49187910654507616,
+    "rmse_eps_mean": 0.0001589200633027976,
+    "rmse_eps_map": 0.00022059417215452114,
+    "mean_cycle_time_s_last_shot": 0.0011130861570400282,
+    "global_true_eps": 0.0014769195730640128,
+    "global_eps_mean": 0.0013333333333333322,
+    "global_eps_std": 0.0,
+    "global_eps_map": 0.0013333333333333322,
+    "global_eps_q05": 6.666666666666662e-05,
+    "global_eps_q50": 0.0006666666666666661,
+    "global_eps_q95": 0.0012666666666666655
+  },
+  "adaptive_catastrophic_count": 503,
+  "fixed_action_summary": {
+    "aT": 1,
+    "aB": 0,
+    "T_s": 7.271077167244768e-05,
+    "Bp_kTm": 0.5,
+    "delta_g_2pi": 0.2649358473722507,
+    "adaptive_phase": true
+  },
+  "fixed_baseline_metrics": {
+    "rmse_g_mean": 0.00823665861972118,
+    "rmse_g_median": 0.008182468179386448,
+    "rmse_g_map": 0.010463318699828467,
+    "mean_post_std_g": 0.008454792515079369,
+    "mean_post_std_eps": 0.00048518640887866977,
+    "mean_entropy_g": 5.416327463201943,
+    "mean_entropy_joint": 5.685902865154182,
+    "rmse_eps_mean": 0.00028982329775824426,
+    "rmse_eps_map": 0.00029688058840737406,
+    "mean_cycle_time_s_last_shot": 0.0004954215433448953,
+    "global_true_eps": 0.0014769195730640128,
+    "global_eps_mean": 0.001331616686324949,
+    "global_eps_std": 4.8237017624158717e-05,
+    "global_eps_map": 0.0013333333333333322,
+    "global_eps_q05": 6.501989218214578e-05,
+    "global_eps_q50": 0.0006658072168636756,
+    "global_eps_q95": 0.0012665945415452054
+  },
+  "fixed_catastrophic_count": 30
+}

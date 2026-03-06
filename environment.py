@@ -1,4 +1,3 @@
-# environment.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -66,29 +65,20 @@ def make_paper_scale_grid(
 @dataclass(frozen=True)
 class NoiseConfig:
     """
-    Purely exogenous control/noise model.
+    In this hierarchical version:
 
-    - trap_visibility_mode:
-        "none"              -> A = 1
-        "small_noise_avg"   -> uses supplement Eq. (S67)-style average visibility
-        "exact_single_delta"-> samples one trap-frequency deviation per shot and uses Eq. (S65)
+    - sigma_omega_rel controls trap-frequency-induced visibility reduction
+    - mfg_rel_noise_bound defines the support of the stable unknown hardware bias:
+          true B' = B'_nom * (1 + eps_true_global)
+      where eps_true_global is fixed over the whole evaluation run
 
-    - mfg_rel_noise_bound:
-        bounded multiplicative control uncertainty on B'
-        i.e. true B' = B'_nom * (1 + eps), eps ~ Uniform[-b, +b]
-
-    - mfg_marginal_points:
-        number of equally spaced quadrature points used to marginalize bounded
-        MFG noise in the Bayesian likelihood.
-        5 is a good default for mild-noise studies.
+    So mfg_rel_noise_bound is NOT shot-to-shot noise here.
+    It is the prior support for the global unknown epsilon.
     """
 
     sigma_omega_rel: float = 0.0
     trap_visibility_mode: Literal["none", "small_noise_avg", "exact_single_delta"] = "small_noise_avg"
-
     mfg_rel_noise_bound: float = 0.0
-    mfg_marginal_points: int = 5
-
     T2_spin_s: float | None = None
 
 
@@ -99,33 +89,24 @@ class PlannerConfig:
         "variance_reduction" or "information_gain"
 
     phase_mode:
-        "analytic_quadrature" -> phi = pi/2 - E[phase]
-        "grid_expected_fi"    -> search phase grid by expected Fisher information
-
-    robust_mfg_mode:
-        "nominal"  -> plan using nominal B'
-        "average3" -> average utility over B'*(1-b), B', B'*(1+b)
-        "worst3"   -> minimum utility over B'*(1-b), B', B'*(1+b)
+        "analytic_quadrature" -> uses circular mean of phase under joint posterior
+        "grid_expected_fi"    -> searches phase grid by expected FI wrt g
 
     Alias gate:
-        We now gate actions using a posterior credible half-width h_q:
-            h_q = (q_high - q_low) / 2
+        reject if k_max * h_q > alias_halfwidth_max_rad
 
-        and reject actions if
-            k_max * h_q > alias_halfwidth_max_rad
-
-        This replaces the old std-based gate.
+        where h_q is the credible half-width of the g-marginal posterior.
     """
 
     objective: Literal["variance_reduction", "information_gain"] = "variance_reduction"
     phase_mode: Literal["analytic_quadrature", "grid_expected_fi"] = "analytic_quadrature"
     phase_grid_size: int = 181
 
+    # kept for compatibility; no longer needed when epsilon is explicitly modeled
     robust_mfg_mode: Literal["nominal", "average3", "worst3"] = "nominal"
 
-    # ---- credible-width alias gate ----
     alias_halfwidth_max_rad: float | None = None
-    alias_credible_mass: float = 0.90  # e.g. 0.90 => use [q05, q95]
+    alias_credible_mass: float = 0.90
 
     cycle_penalty: float = 0.0
     mfg_penalty: float = 0.0
@@ -135,7 +116,8 @@ class PlannerConfig:
 @dataclass(frozen=True)
 class EnvConfig:
     episode_len: int = 64
-    n_g_grid: int = 1024
+    n_g_grid: int = 512
+    n_eps_grid: int = 31
 
 
 # ============================================================
@@ -150,15 +132,11 @@ class GravimeterModel:
 
         P(+|g) = 1/2 [1 + A cos(DeltaPhi(g) + phi_MW)]
 
-    with affine-in-g accumulated phase:
-        DeltaPhi(g) = k_g(T, B') * g
+    with
+        DeltaPhi(g; T, B') = k_g(T, B') * g
 
-    where
+    and
         k_g(T, B') = (2 gamma_e / omega) B' T^2 + (8 pi gamma_e / omega^3) B'
-
-    This is equivalent to using
-        DeltaPhi = (2 eta / y0) g T^2 + 16 pi eta_g eta
-    with eta = gamma_e B' y0 / omega and eta_g = M g y0 / (hbar omega).
     """
 
     omega_rad_s: float = 2.0 * np.pi * 10e3
@@ -183,7 +161,6 @@ class GravimeterModel:
         return float(2.0 * np.pi / self.omega_rad_s)
 
     def cycle_time_s(self, T_s: float) -> float:
-        # five-step protocol total time: 7τ/2 + 2T
         return float(3.5 * self.tau_s + 2.0 * T_s)
 
     def y0_m(self) -> float:
@@ -209,12 +186,9 @@ class GravimeterModel:
         k = self.k_g(T_s, Bp_kTm)
         return float(2.0 * np.pi / max(k, 1e-30))
 
-    # ---------------- visibility model ----------------
+    # ---------------- visibility ----------------
 
     def visibility_exact_from_delta_omega(self, Bp_kTm: float, delta_omega_rad_s: float) -> float:
-        """
-        Supplement Eq. (S65), with delta_t = -tau * delta_omega / omega.
-        """
         eta = float(self.eta(Bp_kTm))
         delta_t = -self.tau_s * float(delta_omega_rad_s) / self.omega_rad_s
         x = self.omega_rad_s * delta_t
@@ -222,10 +196,6 @@ class GravimeterModel:
         return float(np.clip(A, 0.0, 1.0))
 
     def visibility_avg_small_noise(self, Bp_kTm: float, sigma_omega_rel: float) -> float:
-        """
-        Supplement Eq. (S67) in relative-noise form:
-            Abar ≈ 1 - 1944*pi^4 * eta^2 * (sigma_omega/omega)^4
-        """
         eta = float(self.eta(Bp_kTm))
         correction = 1944.0 * (np.pi ** 4) * (eta ** 2) * (sigma_omega_rel ** 4)
         return float(np.clip(1.0 - correction, 0.0, 1.0))
@@ -234,7 +204,6 @@ class GravimeterModel:
         if noise.trap_visibility_mode == "none":
             A = 1.0
         else:
-            # planner uses deterministic average visibility
             A = self.visibility_avg_small_noise(Bp_kTm, noise.sigma_omega_rel)
 
         if noise.T2_spin_s is not None and noise.T2_spin_s > 0.0:
@@ -256,68 +225,7 @@ class GravimeterModel:
             A *= float(np.exp(-self.cycle_time_s(T_s) / noise.T2_spin_s))
         return float(np.clip(A, 0.0, 1.0))
 
-    # ---------------- control perturbation ----------------
-
-    def sample_effective_Bp_kTm(self, Bp_nom_kTm: float, noise: NoiseConfig, rng: np.random.Generator) -> float:
-        bound = float(max(noise.mfg_rel_noise_bound, 0.0))
-        if bound <= 0.0:
-            return float(Bp_nom_kTm)
-        xi = rng.uniform(-bound, +bound)
-        return float(max(1e-12, Bp_nom_kTm * (1.0 + xi)))
-    
-    # ---------------- bounded-MFG likelihood marginalization ----------------
-
-    def mfg_eps_grid(self, noise: NoiseConfig) -> np.ndarray:
-        """
-        Deterministic quadrature grid for bounded multiplicative MFG noise:
-            eps ~ Uniform[-b, +b]
-
-        Returns [0.] if no MFG noise is enabled.
-        """
-        b = float(max(noise.mfg_rel_noise_bound, 0.0))
-        n = int(max(getattr(noise, "mfg_marginal_points", 5), 1))
-
-        if b <= 0.0 or n <= 1:
-            return np.array([0.0], dtype=np.float64)
-
-        return np.linspace(-b, +b, n, dtype=np.float64)
-
-    def prob_plus_marginalized_mfg(
-        self,
-        g_m_s2: float | ArrayF,
-        T_s: float,
-        Bp_nom_kTm: float,
-        mw_phase_rad: float,
-        noise: NoiseConfig,
-    ) -> float | ArrayF:
-        """
-        Readout probability marginalized over bounded multiplicative MFG noise:
-
-            eps ~ Uniform[-b, +b]
-            Bp_true = Bp_nom * (1 + eps)
-
-        We average the full probability over an equally spaced quadrature grid.
-        This is the correct Bayesian likelihood to use when the simulator samples
-        shot-to-shot bounded MFG perturbations but the filter does not estimate eps
-        as a latent state.
-        """
-        eps_grid = self.mfg_eps_grid(noise)
-
-        acc = None
-        for eps in eps_grid:
-            B_eff = max(1e-12, float(Bp_nom_kTm) * (1.0 + float(eps)))
-            A_eff = self.planning_visibility(T_s, B_eff, noise)
-            p = self.prob_plus(g_m_s2, T_s, B_eff, mw_phase_rad, A_eff)
-
-            if acc is None:
-                acc = np.asarray(p, dtype=np.float64)
-            else:
-                acc = acc + np.asarray(p, dtype=np.float64)
-
-        out = acc / float(len(eps_grid))
-        return np.clip(out, self.eps_prob, 1.0 - self.eps_prob)
-
-    # ---------------- readout probability / Fisher ----------------
+    # ---------------- readout ----------------
 
     def prob_plus(
         self,
@@ -347,149 +255,226 @@ class GravimeterModel:
 
 
 # ============================================================
-# 1D Bayesian belief over gravity
+# Joint belief p(g, eps)
 # ============================================================
 
 
-class GravityGridBelief:
-    def __init__(self, prior: PriorConfig, n_grid: int = 1024):
-        if n_grid < 64:
-            raise ValueError("n_grid must be >= 64")
-        self.prior = prior
-        self.n_grid = int(n_grid)
-        self.g_grid = np.linspace(prior.g_range[0], prior.g_range[1], self.n_grid, dtype=np.float64)
-        self.g2_grid = self.g_grid ** 2
-        self.logw = np.full(self.n_grid, -np.log(self.n_grid), dtype=np.float64)
+class JointGravityEpsBelief:
+    """
+    Joint posterior over:
+        g   : episode-specific gravity
+        eps : global MFG scale bias
 
-    def copy(self) -> "GravityGridBelief":
-        out = GravityGridBelief(self.prior, self.n_grid)
+    eps is assumed fixed over the whole run, but unknown.
+    """
+
+    def __init__(
+        self,
+        prior: PriorConfig,
+        noise: NoiseConfig,
+        n_g_grid: int = 512,
+        n_eps_grid: int = 31,
+    ):
+        if n_g_grid < 64:
+            raise ValueError("n_g_grid must be >= 64")
+
+        self.prior = prior
+        self.noise = noise
+        self.n_g_grid = int(n_g_grid)
+        self.n_eps_grid = int(max(1, n_eps_grid))
+
+        self.g_grid = np.linspace(prior.g_range[0], prior.g_range[1], self.n_g_grid, dtype=np.float64)
+        self.g2_grid = self.g_grid ** 2
+
+        b = float(max(noise.mfg_rel_noise_bound, 0.0))
+        if b <= 0.0 or self.n_eps_grid == 1:
+            self.eps_grid = np.array([0.0], dtype=np.float64)
+        else:
+            self.eps_grid = np.linspace(-b, +b, self.n_eps_grid, dtype=np.float64)
+        self.eps2_grid = self.eps_grid ** 2
+
+        self.n_eps_grid = int(self.eps_grid.size)
+        self.logw = np.full((self.n_g_grid, self.n_eps_grid), -np.log(self.n_g_grid * self.n_eps_grid), dtype=np.float64)
+
+    def copy(self) -> "JointGravityEpsBelief":
+        out = JointGravityEpsBelief(
+            prior=self.prior,
+            noise=self.noise,
+            n_g_grid=self.n_g_grid,
+            n_eps_grid=self.n_eps_grid,
+        )
         out.logw = self.logw.copy()
         return out
 
-    @property
-    def w(self) -> np.ndarray:
-        m = float(np.max(self.logw))
-        x = np.exp(self.logw - m)
-        return x / (np.sum(x) + 1e-300)
-
-    def reset_uniform(self) -> None:
-        self.logw.fill(-np.log(self.n_grid))
+    # ---------------- normalization / marginals ----------------
 
     def normalize_(self) -> None:
         m = float(np.max(self.logw))
         z = m + np.log(np.sum(np.exp(self.logw - m)) + 1e-300)
         self.logw -= z
 
-    def mean(self) -> float:
-        w = self.w
-        return float(np.sum(w * self.g_grid))
+    @property
+    def w_joint(self) -> np.ndarray:
+        m = float(np.max(self.logw))
+        x = np.exp(self.logw - m)
+        return x / (np.sum(x) + 1e-300)
 
-    def second_moment(self) -> float:
-        w = self.w
-        return float(np.sum(w * self.g2_grid))
+    def uniform_logw_eps(self) -> np.ndarray:
+        return np.full(self.n_eps_grid, -np.log(self.n_eps_grid), dtype=np.float64)
 
-    def variance(self) -> float:
-        mu = self.mean()
-        ex2 = self.second_moment()
-        return float(max(ex2 - mu * mu, 0.0))
+    def reset_factorized(self, logw_eps_global: np.ndarray | None = None) -> None:
+        if logw_eps_global is None:
+            logw_eps_global = self.uniform_logw_eps()
 
-    def std(self) -> float:
-        return float(np.sqrt(self.variance()))
+        if logw_eps_global.shape != (self.n_eps_grid,):
+            raise ValueError("logw_eps_global shape mismatch")
 
-    def quantile(self, q: float) -> float:
-        """
-        Weighted posterior quantile on the fixed gravity grid.
-        """
+        logw_g_uniform = np.full(self.n_g_grid, -np.log(self.n_g_grid), dtype=np.float64)
+        self.logw = logw_g_uniform[:, None] + logw_eps_global[None, :]
+        self.normalize_()
+
+    def w_g_marginal(self) -> np.ndarray:
+        return np.sum(self.w_joint, axis=1)
+
+    def w_eps_marginal(self) -> np.ndarray:
+        return np.sum(self.w_joint, axis=0)
+
+    def logw_eps_marginal(self) -> np.ndarray:
+        w = self.w_eps_marginal()
+        return np.log(w + 1e-300)
+
+    # ---------------- weighted summaries ----------------
+
+    @staticmethod
+    def _weighted_quantile(grid: np.ndarray, w: np.ndarray, q: float) -> float:
         q = float(np.clip(q, 0.0, 1.0))
-        w = self.w
-        cdf = np.cumsum(w)
-        return float(np.interp(q, cdf, self.g_grid))
+        cdf = np.cumsum(w / (np.sum(w) + 1e-300))
+        return float(np.interp(q, cdf, grid))
 
-    def credible_interval(self, mass: float = 0.90) -> tuple[float, float]:
-        """
-        Central posterior credible interval [q_low, q_high].
-        Example:
-            mass=0.90 -> [q05, q95]
-        """
+    def mean_g(self) -> float:
+        wg = self.w_g_marginal()
+        return float(np.sum(wg * self.g_grid))
+
+    def std_g(self) -> float:
+        wg = self.w_g_marginal()
+        mu = float(np.sum(wg * self.g_grid))
+        ex2 = float(np.sum(wg * self.g2_grid))
+        return float(np.sqrt(max(ex2 - mu * mu, 0.0)))
+
+    def median_g(self) -> float:
+        return self._weighted_quantile(self.g_grid, self.w_g_marginal(), 0.5)
+
+    def map_g(self) -> float:
+        wg = self.w_g_marginal()
+        return float(self.g_grid[int(np.argmax(wg))])
+
+    def entropy_g_nats(self) -> float:
+        wg = self.w_g_marginal()
+        return float(-np.sum(wg * np.log(wg + 1e-300)))
+
+    def credible_interval_g(self, mass: float = 0.90) -> tuple[float, float]:
         mass = float(np.clip(mass, 1e-6, 0.999999))
         alpha = 0.5 * (1.0 - mass)
-        q_lo = self.quantile(alpha)
-        q_hi = self.quantile(1.0 - alpha)
-        return float(q_lo), float(q_hi)
+        wg = self.w_g_marginal()
+        return (
+            self._weighted_quantile(self.g_grid, wg, alpha),
+            self._weighted_quantile(self.g_grid, wg, 1.0 - alpha),
+        )
 
-    def credible_halfwidth(self, mass: float = 0.90) -> float:
-        q_lo, q_hi = self.credible_interval(mass=mass)
+    def credible_halfwidth_g(self, mass: float = 0.90) -> float:
+        q_lo, q_hi = self.credible_interval_g(mass=mass)
         return 0.5 * float(q_hi - q_lo)
 
-    def median(self) -> float:
-        return self.quantile(0.5)
-
-    def map(self) -> float:
-        return float(self.g_grid[int(np.argmax(self.logw))])
-
-    def entropy_nats(self) -> float:
-        w = self.w
-        return float(-np.sum(w * np.log(w + 1e-300)))
-
-    def peak_stats(self) -> tuple[float, float, float]:
-        p = self.w
-        idx1 = int(np.argmax(p))
-        p1 = float(p[idx1])
-        p2 = float(np.max(np.delete(p, idx1))) if p.size > 1 else 0.0
+    def peak_stats_g(self) -> tuple[float, float, float]:
+        wg = self.w_g_marginal()
+        idx1 = int(np.argmax(wg))
+        p1 = float(wg[idx1])
+        p2 = float(np.max(np.delete(wg, idx1))) if wg.size > 1 else 0.0
         return p1, p2, p1 - p2
 
-    def top_peaks(self, k: int = 5) -> list[tuple[float, float]]:
-        """
-        Return top-k grid peaks as (g_value, prob).
-        """
-        p = self.w
-        K = int(min(max(1, k), p.size))
-        idx = np.argpartition(p, -K)[-K:]
-        idx = idx[np.argsort(p[idx])[::-1]]
-        return [(float(self.g_grid[i]), float(p[i])) for i in idx]
+    def top_peaks_g(self, k: int = 5) -> list[tuple[float, float]]:
+        wg = self.w_g_marginal()
+        K = int(min(max(1, k), wg.size))
+        idx = np.argpartition(wg, -K)[-K:]
+        idx = idx[np.argsort(wg[idx])[::-1]]
+        return [(float(self.g_grid[i]), float(wg[i])) for i in idx]
 
-    def posterior_stats_for_likelihood(self, like: np.ndarray) -> tuple[float, float, float]:
-        """
-        Return (Z, mean_post, var_post) for posterior proportional to w * like.
-        """
-        w = self.w
-        s = w * like
+    def mean_eps(self) -> float:
+        we = self.w_eps_marginal()
+        return float(np.sum(we * self.eps_grid))
+
+    def std_eps(self) -> float:
+        we = self.w_eps_marginal()
+        mu = float(np.sum(we * self.eps_grid))
+        ex2 = float(np.sum(we * self.eps2_grid))
+        return float(np.sqrt(max(ex2 - mu * mu, 0.0)))
+
+    def median_eps(self) -> float:
+        return self._weighted_quantile(self.eps_grid, self.w_eps_marginal(), 0.5)
+
+    def map_eps(self) -> float:
+        we = self.w_eps_marginal()
+        return float(self.eps_grid[int(np.argmax(we))])
+
+    def entropy_joint_nats(self) -> float:
+        wj = self.w_joint
+        return float(-np.sum(wj * np.log(wj + 1e-300)))
+
+    def credible_interval_eps(self, mass: float = 0.90) -> tuple[float, float]:
+        mass = float(np.clip(mass, 1e-6, 0.999999))
+        alpha = 0.5 * (1.0 - mass)
+        we = self.w_eps_marginal()
+        return (
+            self._weighted_quantile(self.eps_grid, we, alpha),
+            self._weighted_quantile(self.eps_grid, we, 1.0 - alpha),
+        )
+
+    # ---------------- posterior under hypothetical likelihood ----------------
+
+    def posterior_stats_g_for_likelihood(self, like_ge: np.ndarray) -> tuple[float, float, float]:
+        w = self.w_joint
+        s = w * like_ge
         Z = float(np.sum(s) + 1e-300)
-        mu = float(np.sum(s * self.g_grid) / Z)
-        ex2 = float(np.sum(s * self.g2_grid) / Z)
+        wg_post = np.sum(s, axis=1) / Z
+        mu = float(np.sum(wg_post * self.g_grid))
+        ex2 = float(np.sum(wg_post * self.g2_grid))
         var = float(max(ex2 - mu * mu, 0.0))
         return Z, mu, var
 
-    def posterior_entropy_for_likelihood(self, like: np.ndarray) -> tuple[float, float]:
-        """
-        Return (Z, H_post) for posterior proportional to w * like.
-        """
-        w = self.w
-        s = w * like
+    def posterior_entropy_g_for_likelihood(self, like_ge: np.ndarray) -> tuple[float, float]:
+        w = self.w_joint
+        s = w * like_ge
         Z = float(np.sum(s) + 1e-300)
-        wn = s / Z
-        H = float(-np.sum(wn * np.log(wn + 1e-300)))
+        wg_post = np.sum(s, axis=1) / Z
+        H = float(-np.sum(wg_post * np.log(wg_post + 1e-300)))
         return Z, H
+
+    # ---------------- exact Bayesian update ----------------
 
     def update_from_outcome(
         self,
         model: GravimeterModel,
         T_s: float,
-        Bp_kTm: float,
+        Bp_nom_kTm: float,
         mw_phase_rad: float,
         noise: NoiseConfig,
         outcome_plus: int,
     ) -> None:
         """
-        Bayesian update using the MFG-noise-marginalized likelihood.
+        Exact joint update under stable latent epsilon:
+
+            Bp_true = Bp_nom * (1 + eps)
+
+        likelihood is computed on the full (g, eps) grid.
         """
-        p_plus = model.prob_plus_marginalized_mfg(
-            self.g_grid,
-            T_s,
-            Bp_kTm,
-            mw_phase_rad,
-            noise,
-        )
+        B_eff_eps = np.maximum(1e-12, float(Bp_nom_kTm) * (1.0 + self.eps_grid))
+        k_eps = np.asarray([model.k_g(T_s, float(B)) for B in B_eff_eps], dtype=np.float64)
+        A_eps = np.asarray([model.planning_visibility(T_s, float(B), noise) for B in B_eff_eps], dtype=np.float64)
+
+        theta = self.g_grid[:, None] * k_eps[None, :] + float(mw_phase_rad)
+        p_plus = 0.5 * (1.0 + A_eps[None, :] * np.cos(theta))
+        p_plus = np.clip(p_plus, model.eps_prob, 1.0 - model.eps_prob)
+
         like = p_plus if int(outcome_plus) == 1 else (1.0 - p_plus)
         self.logw += np.log(like + 1e-300)
         self.normalize_()
@@ -519,8 +504,8 @@ class AdaptiveBayesController:
         cyc_list = []
         A_list = []
 
-        for i, T_s in enumerate(self.grid.T_vals_s):
-            for j, Bp_kTm in enumerate(self.grid.Bp_vals_kTm):
+        for T_s in self.grid.T_vals_s:
+            for Bp_kTm in self.grid.Bp_vals_kTm:
                 T = float(T_s)
                 B = float(Bp_kTm)
                 T_list.append(T)
@@ -535,73 +520,87 @@ class AdaptiveBayesController:
         self.cycle_flat = np.asarray(cyc_list, dtype=np.float64)
         self.A_flat = np.asarray(A_list, dtype=np.float64)
 
-    def robust_deltas(self) -> list[float]:
-        b = float(max(self.noise.mfg_rel_noise_bound, 0.0))
-        if b <= 0.0 or self.cfg.robust_mfg_mode == "nominal":
-            return [0.0]
-        return [-b, 0.0, +b]
-
     @staticmethod
     def wrap_to_pi(x: float) -> float:
         return float((x + np.pi) % (2.0 * np.pi) - np.pi)
 
-    def choose_phase(self, belief: GravityGridBelief, T_s: float, Bp_kTm: float) -> float:
+    def _phase_components(
+        self,
+        belief: JointGravityEpsBelief,
+        T_s: float,
+        Bp_nom_kTm: float,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        B_eff_eps = np.maximum(1e-12, float(Bp_nom_kTm) * (1.0 + belief.eps_grid))
+        k_eps = np.asarray([self.model.k_g(T_s, float(B)) for B in B_eff_eps], dtype=np.float64)
+        A_eps = np.asarray([self.model.planning_visibility(T_s, float(B), self.noise) for B in B_eff_eps], dtype=np.float64)
+        theta0 = belief.g_grid[:, None] * k_eps[None, :]
+        return B_eff_eps, k_eps, A_eps, theta0
+
+    def choose_phase(self, belief: JointGravityEpsBelief, T_s: float, Bp_nom_kTm: float) -> float:
+        B_eff_eps, k_eps, A_eps, theta0 = self._phase_components(belief, T_s, Bp_nom_kTm)
+
         if self.cfg.phase_mode == "analytic_quadrature":
-            mu = belief.mean()
-            phi = 0.5 * np.pi - self.model.phase_total(mu, T_s, Bp_kTm)
+            wj = belief.w_joint
+            C = np.sum(wj * np.exp(1j * theta0))
+            if abs(C) < 1e-18:
+                return 0.0
+            phi = 0.5 * np.pi - np.angle(C)
             return self.wrap_to_pi(float(phi))
 
         if self.cfg.phase_mode == "grid_expected_fi":
-            A = self.model.planning_visibility(T_s, Bp_kTm, self.noise)
             phases = np.linspace(-np.pi, np.pi, self.cfg.phase_grid_size, dtype=np.float64)
-            w = belief.w
-            g = belief.g_grid
+            wj = belief.w_joint
             fi_vals = np.empty_like(phases)
-            for k, phi in enumerate(phases):
-                fi_vals[k] = float(np.sum(w * self.model.fisher_information_g(g, T_s, Bp_kTm, float(phi), A)))
+
+            for i, phi in enumerate(phases):
+                theta = theta0 + float(phi)
+                num = (A_eps[None, :] ** 2) * (np.sin(theta) ** 2)
+                den = 1.0 - (A_eps[None, :] ** 2) * (np.cos(theta) ** 2)
+                fi_ge = (num / np.maximum(den, 1e-18)) * (k_eps[None, :] ** 2)
+                fi_vals[i] = float(np.sum(wj * fi_ge))
+
             return float(phases[int(np.argmax(fi_vals))])
 
         raise ValueError(f"Unknown phase_mode={self.cfg.phase_mode}")
 
+    def _like_matrix(
+        self,
+        belief: JointGravityEpsBelief,
+        T_s: float,
+        Bp_nom_kTm: float,
+        phi_rad: float,
+    ) -> tuple[np.ndarray, float]:
+        B_eff_eps, k_eps, A_eps, theta0 = self._phase_components(belief, T_s, Bp_nom_kTm)
+        A_nom = float(np.sum(belief.w_eps_marginal() * A_eps))
+
+        theta = theta0 + float(phi_rad)
+        p_plus = 0.5 * (1.0 + A_eps[None, :] * np.cos(theta))
+        p_plus = np.clip(p_plus, self.model.eps_prob, 1.0 - self.model.eps_prob)
+        return p_plus, A_nom
+
     def _single_utility(
         self,
-        belief: GravityGridBelief,
+        belief: JointGravityEpsBelief,
         T_s: float,
-        Bp_eff_kTm: float,
+        Bp_nom_kTm: float,
         phi_rad: float,
     ) -> float:
-        """
-        One-step utility using the same MFG-marginalized likelihood as the Bayesian filter.
+        p_plus_ge, A_nom = self._like_matrix(belief, T_s, Bp_nom_kTm, phi_rad)
 
-        IMPORTANT:
-        This keeps planning and inference consistent under bounded multiplicative MFG noise.
-        """
-        # Use the marginalized readout model, not the nominal one
-        p_plus_g = self.model.prob_plus_marginalized_mfg(
-            belief.g_grid,
-            T_s,
-            Bp_eff_kTm,
-            phi_rad,
-            self.noise,
-        )
-
-        # Optional visibility guard (based on nominal planning visibility at the action center)
-        A_nom = self.model.planning_visibility(T_s, Bp_eff_kTm, self.noise)
         if A_nom < self.cfg.min_visibility:
             return -np.inf
 
         if self.cfg.objective == "variance_reduction":
-            _, _, var1 = belief.posterior_stats_for_likelihood(p_plus_g)
-            _, _, var0 = belief.posterior_stats_for_likelihood(1.0 - p_plus_g)
-            p1 = float(np.sum(belief.w * p_plus_g))
+            _, _, var1 = belief.posterior_stats_g_for_likelihood(p_plus_ge)
+            _, _, var0 = belief.posterior_stats_g_for_likelihood(1.0 - p_plus_ge)
+            p1 = float(np.sum(belief.w_joint * p_plus_ge))
             p0 = 1.0 - p1
-            expected_post_var = p1 * var1 + p0 * var0
-            utility = belief.variance() - expected_post_var
+            utility = belief.std_g() ** 2 - (p1 * var1 + p0 * var0)
 
         elif self.cfg.objective == "information_gain":
-            H_prior = belief.entropy_nats()
-            Z1, H1 = belief.posterior_entropy_for_likelihood(p_plus_g)
-            Z0, H0 = belief.posterior_entropy_for_likelihood(1.0 - p_plus_g)
+            H_prior = belief.entropy_g_nats()
+            Z1, H1 = belief.posterior_entropy_g_for_likelihood(p_plus_ge)
+            Z0, H0 = belief.posterior_entropy_g_for_likelihood(1.0 - p_plus_ge)
             utility = H_prior - (Z1 * H1 + Z0 * H0)
 
         else:
@@ -609,34 +608,19 @@ class AdaptiveBayesController:
 
         return float(utility)
 
-    def _passes_alias_gate(self, belief: GravityGridBelief, T_s: float, B_nom: float) -> bool:
-        """
-        Credible-width alias gate:
-
-            reject if k_max * h_q > alias_halfwidth_max_rad
-
-        where h_q = (q_high - q_low)/2 for the posterior credible interval.
-
-        This version is MFG-noise-aware: it checks the maximum k over the bounded
-        multiplicative MFG support as well.
-        """
+    def _passes_alias_gate(self, belief: JointGravityEpsBelief, T_s: float, Bp_nom_kTm: float) -> bool:
         if self.cfg.alias_halfwidth_max_rad is None:
             return True
 
-        h_q = belief.credible_halfwidth(mass=self.cfg.alias_credible_mass)
-
+        h_q = belief.credible_halfwidth_g(mass=self.cfg.alias_credible_mass)
         max_k = 0.0
-        eps_grid = self.model.mfg_eps_grid(self.noise)
-
-        for delta in self.robust_deltas():
-            B_center = max(1e-12, B_nom * (1.0 + delta))
-            for eps in eps_grid:
-                B_eff = max(1e-12, B_center * (1.0 + float(eps)))
-                max_k = max(max_k, self.model.k_g(T_s, B_eff))
+        for eps in belief.eps_grid:
+            B_eff = max(1e-12, float(Bp_nom_kTm) * (1.0 + float(eps)))
+            max_k = max(max_k, self.model.k_g(T_s, B_eff))
 
         return bool(max_k * h_q <= float(self.cfg.alias_halfwidth_max_rad))
 
-    def score_action(self, belief: GravityGridBelief, aT: int, aB: int) -> tuple[float, float, float]:
+    def score_action(self, belief: JointGravityEpsBelief, aT: int, aB: int) -> tuple[float, float, float]:
         idx = self.grid.encode(aT, aB)
         T_s = float(self.T_flat[idx])
         B_nom = float(self.B_flat[idx])
@@ -647,29 +631,14 @@ class AdaptiveBayesController:
         if not self._passes_alias_gate(belief, T_s, B_nom):
             return -np.inf, phi, A_nom
 
-        deltas = self.robust_deltas()
-        utilities = []
-        for delta in deltas:
-            B_eff = max(1e-12, B_nom * (1.0 + delta))
-            u = self._single_utility(belief, T_s, B_eff, phi)
-            utilities.append(u)
-
-        if not np.all(np.isfinite(utilities)):
-            return -np.inf, phi, A_nom
-
-        if self.cfg.robust_mfg_mode in ("nominal", "average3"):
-            utility = float(np.mean(utilities))
-        elif self.cfg.robust_mfg_mode == "worst3":
-            utility = float(np.min(utilities))
-        else:
-            raise ValueError(f"Unknown robust_mfg_mode={self.cfg.robust_mfg_mode}")
+        utility = self._single_utility(belief, T_s, B_nom, phi)
 
         utility -= float(self.cfg.cycle_penalty) * float(self.cycle_flat[idx])
         utility -= float(self.cfg.mfg_penalty) * abs(B_nom)
 
         return float(utility), phi, A_nom
 
-    def plan_action(self, belief: GravityGridBelief) -> tuple[int, int, float, float, float]:
+    def plan_action(self, belief: JointGravityEpsBelief) -> tuple[int, int, float, float, float]:
         best_score = -np.inf
         best = None
 
@@ -681,13 +650,12 @@ class AdaptiveBayesController:
                     best = (aT, aB, phi, A)
 
         if best is None:
-            # fallback: safest lowest-k action
             idx = int(np.argmin(self.k_flat))
             aT, aB = self.grid.decode(idx)
             T_s = float(self.grid.T_vals_s[aT])
-            Bp_kTm = float(self.grid.Bp_vals_kTm[aB])
-            phi = self.choose_phase(belief, T_s, Bp_kTm)
-            A = self.model.planning_visibility(T_s, Bp_kTm, self.noise)
+            Bp_nom_kTm = float(self.grid.Bp_vals_kTm[aB])
+            phi = self.choose_phase(belief, T_s, Bp_nom_kTm)
+            A = self.model.planning_visibility(T_s, Bp_nom_kTm, self.noise)
             return int(aT), int(aB), float(phi), float(A), float("-inf")
 
         aT, aB, phi, A = best
@@ -695,23 +663,17 @@ class AdaptiveBayesController:
 
 
 # ============================================================
-# Simulation environment
+# Environment
 # ============================================================
 
 
 class GravimeterEnv:
     """
-    Simulation environment for the pure Bayesian adaptive controller.
+    Hierarchical environment:
 
-    Hidden state:
-        true_g
-
-    Belief state:
-        1D Bayesian posterior over g only
-
-    Important:
-        The filter does NOT estimate hidden nuisance states.
-        Control/noise uncertainty is treated exogenously in simulation/planning.
+    - true_g changes every episode
+    - global_true_eps is fixed across the whole run
+    - belief is episode-local joint p(g, eps), initialized from current global eps posterior
     """
 
     def __init__(
@@ -730,16 +692,31 @@ class GravimeterEnv:
         self.cfg = env_cfg
         self.rng = np.random.default_rng(seed)
 
-        self.belief = GravityGridBelief(prior, n_grid=env_cfg.n_g_grid)
+        self.belief = JointGravityEpsBelief(
+            prior=prior,
+            noise=noise,
+            n_g_grid=env_cfg.n_g_grid,
+            n_eps_grid=env_cfg.n_eps_grid,
+        )
+
         self.true_g = 0.0
+        self.global_true_eps: float | None = None
         self.t = 0
 
     def sample_true_g(self) -> float:
         return float(self.rng.uniform(self.prior.g_range[0], self.prior.g_range[1]))
 
-    def reset(self) -> None:
+    def sample_global_true_eps(self) -> float:
+        b = float(max(self.noise.mfg_rel_noise_bound, 0.0))
+        if b <= 0.0:
+            return 0.0
+        return float(self.rng.uniform(-b, +b))
+
+    def reset(self, logw_eps_global: np.ndarray | None = None) -> None:
         self.true_g = self.sample_true_g()
-        self.belief.reset_uniform()
+        if self.global_true_eps is None:
+            self.global_true_eps = self.sample_global_true_eps()
+        self.belief.reset_factorized(logw_eps_global)
         self.t = 0
 
     def step(
@@ -751,22 +728,19 @@ class GravimeterEnv:
         T_s = float(self.grid.T_vals_s[int(aT)])
         Bp_nom_kTm = float(self.grid.Bp_vals_kTm[int(aB)])
 
-        # Filter/planner model
-        A_model = self.model.planning_visibility(T_s, Bp_nom_kTm, self.noise)
+        eps_true = float(0.0 if self.global_true_eps is None else self.global_true_eps)
+        Bp_true_kTm = float(max(1e-12, Bp_nom_kTm * (1.0 + eps_true)))
 
-        # True applied control / true shot visibility
-        Bp_true_kTm = self.model.sample_effective_Bp_kTm(Bp_nom_kTm, self.noise, self.rng)
+        A_model = self.model.planning_visibility(T_s, Bp_nom_kTm, self.noise)
         A_true = self.model.shot_visibility(T_s, Bp_true_kTm, self.noise, self.rng)
 
-        # Generate measurement
         p_plus_true = float(self.model.prob_plus(self.true_g, T_s, Bp_true_kTm, mw_phase_rad, A_true))
         outcome_plus = 1 if (self.rng.random() < p_plus_true) else 0
 
-        # Bayesian update under nominal control model
         self.belief.update_from_outcome(
             model=self.model,
             T_s=T_s,
-            Bp_kTm=Bp_nom_kTm,
+            Bp_nom_kTm=Bp_nom_kTm,
             mw_phase_rad=mw_phase_rad,
             noise=self.noise,
             outcome_plus=outcome_plus,
@@ -775,11 +749,15 @@ class GravimeterEnv:
         self.t += 1
         done = bool(self.t >= self.cfg.episode_len)
 
-        post_mu = self.belief.mean()
-        post_std = self.belief.std()
-        post_med = self.belief.median()
-        post_map = self.belief.map()
-        post_H = self.belief.entropy_nats()
+        post_mu_g = self.belief.mean_g()
+        post_std_g = self.belief.std_g()
+        post_med_g = self.belief.median_g()
+        post_map_g = self.belief.map_g()
+
+        post_mu_eps = self.belief.mean_eps()
+        post_std_eps = self.belief.std_eps()
+        post_med_eps = self.belief.median_eps()
+        post_map_eps = self.belief.map_eps()
 
         info = {
             "t": float(self.t),
@@ -791,15 +769,31 @@ class GravimeterEnv:
             "A_true": float(A_true),
             "p_plus_true": float(p_plus_true),
             "outcome_plus": float(outcome_plus),
+
             "true_g": float(self.true_g),
-            "post_mu_g": float(post_mu),
-            "post_std_g": float(post_std),
-            "post_median_g": float(post_med),
-            "post_map_g": float(post_map),
-            "post_entropy_g": float(post_H),
-            "g_err_mean": float(post_mu - self.true_g),
-            "g_err_median": float(post_med - self.true_g),
-            "g_err_map": float(post_map - self.true_g),
+            "true_eps": float(eps_true),
+
+            "post_mu_g": float(post_mu_g),
+            "post_std_g": float(post_std_g),
+            "post_median_g": float(post_med_g),
+            "post_map_g": float(post_map_g),
+
+            "post_mu_eps": float(post_mu_eps),
+            "post_std_eps": float(post_std_eps),
+            "post_median_eps": float(post_med_eps),
+            "post_map_eps": float(post_map_eps),
+
+            "post_entropy_g": float(self.belief.entropy_g_nats()),
+            "post_entropy_joint": float(self.belief.entropy_joint_nats()),
+
+            "g_err_mean": float(post_mu_g - self.true_g),
+            "g_err_median": float(post_med_g - self.true_g),
+            "g_err_map": float(post_map_g - self.true_g),
+
+            "eps_err_mean": float(post_mu_eps - eps_true),
+            "eps_err_median": float(post_med_eps - eps_true),
+            "eps_err_map": float(post_map_eps - eps_true),
+
             "k_g_nom": float(self.model.k_g(T_s, Bp_nom_kTm)),
             "dg2pi_nom": float(self.model.delta_g_period_2pi(T_s, Bp_nom_kTm)),
             "cycle_time_s": float(self.model.cycle_time_s(T_s)),

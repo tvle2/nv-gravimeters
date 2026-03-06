@@ -1,5 +1,6 @@
 {
-  "seed": 0,
+  "seed": 42,
+  "global_eps_seed": 12387,
   "prior": {
     "g_range": [
       9.7639,
@@ -44,12 +45,12 @@
     "sigma_omega_rel": 0.0,
     "trap_visibility_mode": "small_noise_avg",
     "mfg_rel_noise_bound": 0.02,
-    "mfg_marginal_points": 5,
     "T2_spin_s": null
   },
   "env_cfg": {
     "episode_len": 32,
-    "n_g_grid": 1024
+    "n_g_grid": 512,
+    "n_eps_grid": 31
   },
   "planner_cfg": {
     "objective": "variance_reduction",
@@ -62,8 +63,8 @@
     "mfg_penalty": 0.0,
     "min_visibility": 0.0
   },
-  "adaptive_eval_episodes": 256,
-  "fixed_baseline_episodes": 64,
+  "adaptive_eval_episodes": 512,
+  "fixed_baseline_episodes": 32,
   "run_fixed_baseline": true,
   "fixed_baseline_adaptive_phase": true
 }
