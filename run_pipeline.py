@@ -41,8 +41,8 @@ PRIOR = PriorConfig(
 
 # ---- Action grid ----
 GRID: ActionGrid = make_paper_scale_grid(
-    n_T=9,
-    n_B=9,
+    n_T=15,
+    n_B=15,
     T_min_s=50e-6,
     T_max_s=1.0e-3,
     B_min_kTm=0.5,
@@ -73,9 +73,9 @@ NOISE = NoiseConfig(
 
 # ---- Environment ----
 ENV_CFG = EnvConfig(
-    episode_len=32,
-    n_g_grid=512,
-    n_eps_grid=31,
+    episode_len=32, # fast: 32, mild: 128
+    n_g_grid=512, # fast: 512, mild: 1024
+    n_eps_grid=51, #fast: 31, mild: 51
 )
 
 # ---- Planner ----

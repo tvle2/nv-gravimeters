@@ -1,3 +1,4 @@
+# environment.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -85,32 +86,60 @@ class NoiseConfig:
 @dataclass(frozen=True)
 class PlannerConfig:
     """
+    Root-cause-fixed adaptive planner.
+
     objective:
-        "variance_reduction" or "information_gain"
+        - "variance_reduction"      : legacy
+        - "information_gain"        : legacy entropy on p(g)
+        - "joint_information_gain"  : entropy reduction on p(g, eps)
+        - "coarse_to_fine"          : branch disambiguation first, then joint refinement
 
     phase_mode:
-        "analytic_quadrature" -> uses circular mean of phase under joint posterior
-        "grid_expected_fi"    -> searches phase grid by expected FI wrt g
-
-    Alias gate:
-        reject if k_max * h_q > alias_halfwidth_max_rad
-
-        where h_q is the credible half-width of the g-marginal posterior.
+        - "analytic_quadrature" : legacy
+        - "grid_expected_fi"    : legacy
+        - "utility_search"      : choose phase by maximizing planning utility
     """
 
-    objective: Literal["variance_reduction", "information_gain"] = "variance_reduction"
-    phase_mode: Literal["analytic_quadrature", "grid_expected_fi"] = "analytic_quadrature"
-    phase_grid_size: int = 181
+    objective: Literal[
+        "variance_reduction",
+        "information_gain",
+        "joint_information_gain",
+        "coarse_to_fine",
+    ] = "coarse_to_fine"
 
-    # kept for compatibility; no longer needed when epsilon is explicitly modeled
-    robust_mfg_mode: Literal["nominal", "average3", "worst3"] = "nominal"
+    phase_mode: Literal[
+        "analytic_quadrature",
+        "grid_expected_fi",
+        "utility_search",
+    ] = "utility_search"
 
-    alias_halfwidth_max_rad: float | None = None
+    # coarse/global phase search when the posterior is still ambiguous
+    phase_grid_size: int = 31
+
+    # local phase search around analytic quadrature after one branch dominates
+    fine_phase_local_grid_size: int = 9
+    fine_phase_local_halfwidth_rad: float = 0.60
+
+    # stage detector
+    coarse_g_bins: int = 16
+    coarse_entropy_threshold_nats: float = 1.10
+    coarse_peak1_mass_threshold: float = 0.55
+    coarse_peak_gap_threshold: float = 0.15
+
+    # wrap control
+    use_hard_alias_gate: bool = False
+    alias_halfwidth_max_rad: float | None = 1.25
     alias_credible_mass: float = 0.90
+    wrap_penalty_weight: float = 0.50
+    target_wraps: float = 0.75
 
+    # optional costs
     cycle_penalty: float = 0.0
     mfg_penalty: float = 0.0
     min_visibility: float = 0.0
+
+    # kept only for compatibility
+    robust_mfg_mode: Literal["nominal", "average3", "worst3"] = "nominal"
 
 
 @dataclass(frozen=True)
@@ -371,6 +400,50 @@ class JointGravityEpsBelief:
     def entropy_g_nats(self) -> float:
         wg = self.w_g_marginal()
         return float(-np.sum(wg * np.log(wg + 1e-300)))
+    
+    def coarse_probs_g(self, n_bins: int = 16) -> np.ndarray:
+        n_bins = int(max(1, n_bins))
+        wg = self.w_g_marginal()
+        idx_bins = np.array_split(np.arange(self.n_g_grid), n_bins)
+        probs = np.asarray([np.sum(wg[idx]) for idx in idx_bins], dtype=np.float64)
+        probs = probs / (np.sum(probs) + 1e-300)
+        return probs
+
+    def coarse_entropy_g(self, n_bins: int = 16) -> float:
+        p = self.coarse_probs_g(n_bins=n_bins)
+        return float(-np.sum(p * np.log(p + 1e-300)))
+
+    def coarse_peak_stats_g(self, n_bins: int = 16) -> tuple[float, float, float]:
+        p = self.coarse_probs_g(n_bins=n_bins)
+        idx1 = int(np.argmax(p))
+        p1 = float(p[idx1])
+        p2 = float(np.max(np.delete(p, idx1))) if p.size > 1 else 0.0
+        return p1, p2, p1 - p2
+
+    def posterior_entropy_joint_for_likelihood(self, like_ge: np.ndarray) -> tuple[float, float]:
+        w = self.w_joint
+        s = w * like_ge
+        Z = float(np.sum(s) + 1e-300)
+        w_post = s / Z
+        H = float(-np.sum(w_post * np.log(w_post + 1e-300)))
+        return Z, H
+
+    def posterior_entropy_coarse_g_for_likelihood(
+        self,
+        like_ge: np.ndarray,
+        n_bins: int = 16,
+    ) -> tuple[float, float]:
+        w = self.w_joint
+        s = w * like_ge
+        Z = float(np.sum(s) + 1e-300)
+        wg_post = np.sum(s, axis=1) / Z
+
+        idx_bins = np.array_split(np.arange(self.n_g_grid), int(max(1, n_bins)))
+        p = np.asarray([np.sum(wg_post[idx]) for idx in idx_bins], dtype=np.float64)
+        p = p / (np.sum(p) + 1e-300)
+
+        H = float(-np.sum(p * np.log(p + 1e-300)))
+        return Z, H
 
     def credible_interval_g(self, mass: float = 0.90) -> tuple[float, float]:
         mass = float(np.clip(mass, 1e-6, 0.999999))
@@ -484,7 +557,6 @@ class JointGravityEpsBelief:
 # Adaptive Bayesian controller
 # ============================================================
 
-
 class AdaptiveBayesController:
     def __init__(
         self,
@@ -520,6 +592,13 @@ class AdaptiveBayesController:
         self.cycle_flat = np.asarray(cyc_list, dtype=np.float64)
         self.A_flat = np.asarray(A_list, dtype=np.float64)
 
+        self.global_phase_grid = np.linspace(
+            -np.pi,
+            np.pi,
+            int(max(5, self.cfg.phase_grid_size)),
+            dtype=np.float64,
+        )
+
     @staticmethod
     def wrap_to_pi(x: float) -> float:
         return float((x + np.pi) % (2.0 * np.pi) - np.pi)
@@ -529,64 +608,111 @@ class AdaptiveBayesController:
         belief: JointGravityEpsBelief,
         T_s: float,
         Bp_nom_kTm: float,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         B_eff_eps = np.maximum(1e-12, float(Bp_nom_kTm) * (1.0 + belief.eps_grid))
-        k_eps = np.asarray([self.model.k_g(T_s, float(B)) for B in B_eff_eps], dtype=np.float64)
-        A_eps = np.asarray([self.model.planning_visibility(T_s, float(B), self.noise) for B in B_eff_eps], dtype=np.float64)
+        k_eps = np.asarray(
+            [self.model.k_g(T_s, float(B)) for B in B_eff_eps],
+            dtype=np.float64,
+        )
+        A_eps = np.asarray(
+            [self.model.planning_visibility(T_s, float(B), self.noise) for B in B_eff_eps],
+            dtype=np.float64,
+        )
         theta0 = belief.g_grid[:, None] * k_eps[None, :]
         return B_eff_eps, k_eps, A_eps, theta0
 
-    def choose_phase(self, belief: JointGravityEpsBelief, T_s: float, Bp_nom_kTm: float) -> float:
-        B_eff_eps, k_eps, A_eps, theta0 = self._phase_components(belief, T_s, Bp_nom_kTm)
+    def _analytic_quadrature_phase_from_theta0(
+        self,
+        belief: JointGravityEpsBelief,
+        theta0: np.ndarray,
+    ) -> float:
+        wj = belief.w_joint
+        C = np.sum(wj * np.exp(1j * theta0))
+        if abs(C) < 1e-18:
+            return 0.0
+        phi = 0.5 * np.pi - np.angle(C)
+        return self.wrap_to_pi(float(phi))
 
+    def _planning_stage(self, belief: JointGravityEpsBelief) -> str:
+        if self.cfg.objective != "coarse_to_fine":
+            return "fine"
+
+        Hc = belief.coarse_entropy_g(n_bins=self.cfg.coarse_g_bins)
+        p1c, p2c, gapc = belief.coarse_peak_stats_g(n_bins=self.cfg.coarse_g_bins)
+
+        if (
+            Hc > float(self.cfg.coarse_entropy_threshold_nats)
+            or p1c < float(self.cfg.coarse_peak1_mass_threshold)
+            or gapc < float(self.cfg.coarse_peak_gap_threshold)
+        ):
+            return "coarse"
+
+        return "fine"
+
+    def _candidate_phases(
+        self,
+        belief: JointGravityEpsBelief,
+        theta0: np.ndarray,
+    ) -> np.ndarray:
         if self.cfg.phase_mode == "analytic_quadrature":
-            wj = belief.w_joint
-            C = np.sum(wj * np.exp(1j * theta0))
-            if abs(C) < 1e-18:
-                return 0.0
-            phi = 0.5 * np.pi - np.angle(C)
-            return self.wrap_to_pi(float(phi))
+            return np.asarray(
+                [self._analytic_quadrature_phase_from_theta0(belief, theta0)],
+                dtype=np.float64,
+            )
 
         if self.cfg.phase_mode == "grid_expected_fi":
-            phases = np.linspace(-np.pi, np.pi, self.cfg.phase_grid_size, dtype=np.float64)
-            wj = belief.w_joint
-            fi_vals = np.empty_like(phases)
+            return self.global_phase_grid
 
-            for i, phi in enumerate(phases):
-                theta = theta0 + float(phi)
-                num = (A_eps[None, :] ** 2) * (np.sin(theta) ** 2)
-                den = 1.0 - (A_eps[None, :] ** 2) * (np.cos(theta) ** 2)
-                fi_ge = (num / np.maximum(den, 1e-18)) * (k_eps[None, :] ** 2)
-                fi_vals[i] = float(np.sum(wj * fi_ge))
+        if self.cfg.phase_mode == "utility_search":
+            stage = self._planning_stage(belief)
 
-            return float(phases[int(np.argmax(fi_vals))])
+            if stage == "coarse":
+                return self.global_phase_grid
+
+            center = self._analytic_quadrature_phase_from_theta0(belief, theta0)
+            offsets = np.linspace(
+                -float(self.cfg.fine_phase_local_halfwidth_rad),
+                +float(self.cfg.fine_phase_local_halfwidth_rad),
+                int(max(3, self.cfg.fine_phase_local_grid_size)),
+                dtype=np.float64,
+            )
+            phases = np.asarray(
+                [self.wrap_to_pi(center + d) for d in offsets],
+                dtype=np.float64,
+            )
+            return phases
 
         raise ValueError(f"Unknown phase_mode={self.cfg.phase_mode}")
 
-    def _like_matrix(
+    def _like_matrix_from_components(
         self,
         belief: JointGravityEpsBelief,
-        T_s: float,
-        Bp_nom_kTm: float,
+        A_eps: np.ndarray,
+        theta0: np.ndarray,
         phi_rad: float,
     ) -> tuple[np.ndarray, float]:
-        B_eff_eps, k_eps, A_eps, theta0 = self._phase_components(belief, T_s, Bp_nom_kTm)
         A_nom = float(np.sum(belief.w_eps_marginal() * A_eps))
-
         theta = theta0 + float(phi_rad)
         p_plus = 0.5 * (1.0 + A_eps[None, :] * np.cos(theta))
         p_plus = np.clip(p_plus, self.model.eps_prob, 1.0 - self.model.eps_prob)
         return p_plus, A_nom
 
-    def _single_utility(
+    def _wrap_penalty_from_k_eps(
         self,
         belief: JointGravityEpsBelief,
-        T_s: float,
-        Bp_nom_kTm: float,
-        phi_rad: float,
+        k_eps: np.ndarray,
     ) -> float:
-        p_plus_ge, A_nom = self._like_matrix(belief, T_s, Bp_nom_kTm, phi_rad)
+        h_q = belief.credible_halfwidth_g(mass=self.cfg.alias_credible_mass)
+        wrap_metric = float(np.max(np.abs(k_eps)) * h_q / np.pi)
+        excess = max(0.0, wrap_metric - float(self.cfg.target_wraps))
+        return float(self.cfg.wrap_penalty_weight) * (excess ** 2)
 
+    def _base_utility_from_like(
+        self,
+        belief: JointGravityEpsBelief,
+        p_plus_ge: np.ndarray,
+        A_nom: float,
+    ) -> float:
         if A_nom < self.cfg.min_visibility:
             return -np.inf
 
@@ -595,21 +721,150 @@ class AdaptiveBayesController:
             _, _, var0 = belief.posterior_stats_g_for_likelihood(1.0 - p_plus_ge)
             p1 = float(np.sum(belief.w_joint * p_plus_ge))
             p0 = 1.0 - p1
-            utility = belief.std_g() ** 2 - (p1 * var1 + p0 * var0)
+            return float(belief.std_g() ** 2 - (p1 * var1 + p0 * var0))
 
-        elif self.cfg.objective == "information_gain":
+        if self.cfg.objective == "information_gain":
             H_prior = belief.entropy_g_nats()
             Z1, H1 = belief.posterior_entropy_g_for_likelihood(p_plus_ge)
             Z0, H0 = belief.posterior_entropy_g_for_likelihood(1.0 - p_plus_ge)
-            utility = H_prior - (Z1 * H1 + Z0 * H0)
+            return float(H_prior - (Z1 * H1 + Z0 * H0))
 
-        else:
-            raise ValueError(f"Unknown objective={self.cfg.objective}")
+        if self.cfg.objective == "joint_information_gain":
+            H_prior = belief.entropy_joint_nats()
+            Z1, H1 = belief.posterior_entropy_joint_for_likelihood(p_plus_ge)
+            Z0, H0 = belief.posterior_entropy_joint_for_likelihood(1.0 - p_plus_ge)
+            return float(H_prior - (Z1 * H1 + Z0 * H0))
 
-        return float(utility)
+        if self.cfg.objective == "coarse_to_fine":
+            stage = self._planning_stage(belief)
+
+            if stage == "coarse":
+                H_prior = belief.coarse_entropy_g(n_bins=self.cfg.coarse_g_bins)
+                Z1, H1 = belief.posterior_entropy_coarse_g_for_likelihood(
+                    p_plus_ge,
+                    n_bins=self.cfg.coarse_g_bins,
+                )
+                Z0, H0 = belief.posterior_entropy_coarse_g_for_likelihood(
+                    1.0 - p_plus_ge,
+                    n_bins=self.cfg.coarse_g_bins,
+                )
+                return float(H_prior - (Z1 * H1 + Z0 * H0))
+
+            H_prior = belief.entropy_joint_nats()
+            Z1, H1 = belief.posterior_entropy_joint_for_likelihood(p_plus_ge)
+            Z0, H0 = belief.posterior_entropy_joint_for_likelihood(1.0 - p_plus_ge)
+            return float(H_prior - (Z1 * H1 + Z0 * H0))
+
+        raise ValueError(f"Unknown objective={self.cfg.objective}")
+
+    def _utility_from_components(
+        self,
+        belief: JointGravityEpsBelief,
+        k_eps: np.ndarray,
+        A_eps: np.ndarray,
+        theta0: np.ndarray,
+        phi_rad: float,
+    ) -> tuple[float, float]:
+        p_plus_ge, A_nom = self._like_matrix_from_components(
+            belief=belief,
+            A_eps=A_eps,
+            theta0=theta0,
+            phi_rad=phi_rad,
+        )
+        utility = self._base_utility_from_like(
+            belief=belief,
+            p_plus_ge=p_plus_ge,
+            A_nom=A_nom,
+        )
+        if not np.isfinite(utility):
+            return float(utility), float(A_nom)
+
+        utility -= self._wrap_penalty_from_k_eps(belief, k_eps)
+        return float(utility), float(A_nom)
+
+    def _best_phase_by_expected_fi(
+        self,
+        belief: JointGravityEpsBelief,
+        k_eps: np.ndarray,
+        A_eps: np.ndarray,
+        theta0: np.ndarray,
+    ) -> tuple[float, float, float]:
+        wj = belief.w_joint
+        A_nom = float(np.sum(belief.w_eps_marginal() * A_eps))
+
+        best_phi = 0.0
+        best_score = -np.inf
+
+        for phi in self.global_phase_grid:
+            theta = theta0 + float(phi)
+            num = (A_eps[None, :] ** 2) * (np.sin(theta) ** 2)
+            den = 1.0 - (A_eps[None, :] ** 2) * (np.cos(theta) ** 2)
+            fi_ge = (num / np.maximum(den, 1e-18)) * (k_eps[None, :] ** 2)
+            score = float(np.sum(wj * fi_ge))
+            score -= self._wrap_penalty_from_k_eps(belief, k_eps)
+
+            if np.isfinite(score) and score > best_score:
+                best_score = float(score)
+                best_phi = float(phi)
+
+        return float(best_phi), float(A_nom), float(best_score)
+
+    def _best_phase_by_utility(
+        self,
+        belief: JointGravityEpsBelief,
+        k_eps: np.ndarray,
+        A_eps: np.ndarray,
+        theta0: np.ndarray,
+    ) -> tuple[float, float, float]:
+        phases = self._candidate_phases(belief, theta0)
+
+        best_phi = 0.0
+        best_A = 0.0
+        best_score = -np.inf
+
+        for phi in phases:
+            score, A_nom = self._utility_from_components(
+                belief=belief,
+                k_eps=k_eps,
+                A_eps=A_eps,
+                theta0=theta0,
+                phi_rad=float(phi),
+            )
+            if np.isfinite(score) and score > best_score:
+                best_phi = float(phi)
+                best_A = float(A_nom)
+                best_score = float(score)
+
+        return float(best_phi), float(best_A), float(best_score)
+
+    def choose_phase(self, belief: JointGravityEpsBelief, T_s: float, Bp_nom_kTm: float) -> float:
+        _B_eff_eps, k_eps, A_eps, theta0 = self._phase_components(belief, T_s, Bp_nom_kTm)
+
+        if self.cfg.phase_mode == "analytic_quadrature":
+            return self._analytic_quadrature_phase_from_theta0(belief, theta0)
+
+        if self.cfg.phase_mode == "grid_expected_fi":
+            phi, _A, _score = self._best_phase_by_expected_fi(
+                belief=belief,
+                k_eps=k_eps,
+                A_eps=A_eps,
+                theta0=theta0,
+            )
+            return float(phi)
+
+        if self.cfg.phase_mode == "utility_search":
+            phi, _A, _score = self._best_phase_by_utility(
+                belief=belief,
+                k_eps=k_eps,
+                A_eps=A_eps,
+                theta0=theta0,
+            )
+            return float(phi)
+
+        raise ValueError(f"Unknown phase_mode={self.cfg.phase_mode}")
 
     def _passes_alias_gate(self, belief: JointGravityEpsBelief, T_s: float, Bp_nom_kTm: float) -> bool:
-        if self.cfg.alias_halfwidth_max_rad is None:
+        if (not self.cfg.use_hard_alias_gate) or (self.cfg.alias_halfwidth_max_rad is None):
             return True
 
         h_q = belief.credible_halfwidth_g(mass=self.cfg.alias_credible_mass)
@@ -624,19 +879,33 @@ class AdaptiveBayesController:
         idx = self.grid.encode(aT, aB)
         T_s = float(self.T_flat[idx])
         B_nom = float(self.B_flat[idx])
-        A_nom = float(self.A_flat[idx])
-
-        phi = self.choose_phase(belief, T_s, B_nom)
 
         if not self._passes_alias_gate(belief, T_s, B_nom):
-            return -np.inf, phi, A_nom
+            phi_fallback = self.choose_phase(belief, T_s, B_nom)
+            A_fallback = self.model.planning_visibility(T_s, B_nom, self.noise)
+            return float("-inf"), float(phi_fallback), float(A_fallback)
 
-        utility = self._single_utility(belief, T_s, B_nom, phi)
+        _B_eff_eps, k_eps, A_eps, theta0 = self._phase_components(belief, T_s, B_nom)
+
+        if self.cfg.phase_mode == "grid_expected_fi":
+            phi, A_nom, utility = self._best_phase_by_expected_fi(
+                belief=belief,
+                k_eps=k_eps,
+                A_eps=A_eps,
+                theta0=theta0,
+            )
+        else:
+            phi, A_nom, utility = self._best_phase_by_utility(
+                belief=belief,
+                k_eps=k_eps,
+                A_eps=A_eps,
+                theta0=theta0,
+            )
 
         utility -= float(self.cfg.cycle_penalty) * float(self.cycle_flat[idx])
         utility -= float(self.cfg.mfg_penalty) * abs(B_nom)
 
-        return float(utility), phi, A_nom
+        return float(utility), float(phi), float(A_nom)
 
     def plan_action(self, belief: JointGravityEpsBelief) -> tuple[int, int, float, float, float]:
         best_score = -np.inf
@@ -660,6 +929,7 @@ class AdaptiveBayesController:
 
         aT, aB, phi, A = best
         return int(aT), int(aB), float(phi), float(A), float(best_score)
+
 
 
 # ============================================================

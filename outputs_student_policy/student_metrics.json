@@ -1,0 +1,17 @@
+{
+  "rmse_g_mean": 0.011154764589153517,
+  "rmse_g_median": 0.011285553047020695,
+  "rmse_g_map": 0.016189932386482597,
+  "mean_post_std_g": 0.00980536439097993,
+  "mean_post_std_eps": 0.002084429019077028,
+  "mean_entropy_g": 4.360546122348274,
+  "mean_entropy_joint": 4.478756808381425,
+  "rmse_eps_mean": 0.0037952017391583983,
+  "rmse_eps_map": 0.0049621726699824184,
+  "mean_cycle_time_s_last_shot": 0.0006526208057621013,
+  "global_eps_abs_err_mean_final": 0.0005752577370217951,
+  "global_eps_abs_err_map_final": 0.000625128240553002,
+  "global_eps_std_final_mean": 0.0005328682349327437,
+  "n_catastrophic_episodes": 487,
+  "n_total_episodes": 512
+}

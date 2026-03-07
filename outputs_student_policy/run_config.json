@@ -48,7 +48,8 @@
   },
   "env_cfg": {
     "episode_len": 32,
-    "n_g_grid": 512
+    "n_g_grid": 512,
+    "n_eps_grid": 31
   },
   "planner_cfg": {
     "objective": "variance_reduction",
@@ -61,35 +62,37 @@
     "mfg_penalty": 0.0,
     "min_visibility": 0.0
   },
-  "global_eps_calibration_stages": [
-    {
-      "after_episode": 0,
-      "n_eps_grid": 31,
-      "halfwidth": 0.02,
-      "center_mode": "map"
-    },
-    {
-      "after_episode": 64,
-      "n_eps_grid": 61,
-      "halfwidth": 0.005,
-      "center_mode": "map"
-    },
-    {
-      "after_episode": 192,
-      "n_eps_grid": 121,
-      "halfwidth": 0.001,
-      "center_mode": "map"
-    },
-    {
-      "after_episode": 384,
-      "n_eps_grid": 241,
-      "halfwidth": 0.00025,
-      "center_mode": "map"
-    }
-  ],
-  "adaptive_eval_episodes": 512,
-  "fixed_baseline_episodes": 32,
-  "run_fixed_baseline": true,
-  "fixed_baseline_adaptive_phase": true,
-  "global_true_eps_for_this_run": 0.010958241942238534
+  "feature_cfg": {
+    "g_hist_bins": 64,
+    "eps_hist_bins": 31,
+    "include_peak_features": true,
+    "include_step_features": true
+  },
+  "dataset_cfg": {
+    "n_runs": 512,
+    "episodes_per_run": 8,
+    "base_seed": 1042,
+    "log_every_runs": 32
+  },
+  "train_cfg": {
+    "device": "cpu",
+    "batch_size": 1024,
+    "epochs": 40,
+    "lr": 0.0003,
+    "weight_decay": 0.0001,
+    "hidden_dim": 256,
+    "depth": 3,
+    "dropout": 0.05,
+    "val_fraction": 0.1,
+    "label_smoothing": 0.0,
+    "early_stop_patience": 8,
+    "seed": 42
+  },
+  "eval_cfg": {
+    "n_runs": 64,
+    "episodes_per_run": 8,
+    "base_seed": 2042,
+    "log_every_runs": 8,
+    "catastrophic_abs_err_threshold": 0.0005
+  }
 }

@@ -1,0 +1,48 @@
+{
+  "teacher_first_action": {
+    "aT": 1,
+    "aB": 0,
+    "T_s": 7.271077167244768e-05,
+    "Bp_kTm": 0.5,
+    "mw_phase_rad": -1.4785745214523232,
+    "visibility_A": 1.0,
+    "score": 3.5244326994643416e-06,
+    "delta_g_2pi": 0.2649358473722507
+  },
+  "teacher_metrics": {
+    "rmse_g_mean": 0.011288041235642206,
+    "rmse_g_median": 0.011388318222208664,
+    "rmse_g_map": 0.01646191551286642,
+    "mean_post_std_g": 0.008975800677805505,
+    "mean_post_std_eps": 0.0011288324683748035,
+    "mean_entropy_g": 4.139838417277343,
+    "mean_entropy_joint": 4.20667555473609,
+    "rmse_eps_mean": 0.0017936760078827824,
+    "rmse_eps_map": 0.0018495497603086674,
+    "mean_cycle_time_s_last_shot": 0.0006465245798791641,
+    "global_eps_abs_err_mean_final": 0.0005877611864830374,
+    "global_eps_abs_err_map_final": 0.0005644920274171738,
+    "global_eps_std_final_mean": 0.00040846168294813017,
+    "n_catastrophic_episodes": 502,
+    "n_total_episodes": 512
+  },
+  "student_metrics": {
+    "rmse_g_mean": 0.011154764589153517,
+    "rmse_g_median": 0.011285553047020695,
+    "rmse_g_map": 0.016189932386482597,
+    "mean_post_std_g": 0.00980536439097993,
+    "mean_post_std_eps": 0.002084429019077028,
+    "mean_entropy_g": 4.360546122348274,
+    "mean_entropy_joint": 4.478756808381425,
+    "rmse_eps_mean": 0.0037952017391583983,
+    "rmse_eps_map": 0.0049621726699824184,
+    "mean_cycle_time_s_last_shot": 0.0006526208057621013,
+    "global_eps_abs_err_mean_final": 0.0005752577370217951,
+    "global_eps_abs_err_map_final": 0.000625128240553002,
+    "global_eps_std_final_mean": 0.0005328682349327437,
+    "n_catastrophic_episodes": 487,
+    "n_total_episodes": 512
+  },
+  "teacher_catastrophic_count": 502,
+  "student_catastrophic_count": 487
+}

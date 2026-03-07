@@ -1,0 +1,17 @@
+{
+  "feature_cfg": {
+    "g_hist_bins": 64,
+    "eps_hist_bins": 31,
+    "include_peak_features": true,
+    "include_step_features": true
+  },
+  "dataset_cfg": {
+    "n_runs": 512,
+    "episodes_per_run": 8,
+    "base_seed": 1042,
+    "log_every_runs": 32
+  },
+  "n_samples": 131072,
+  "input_dim": 112,
+  "n_actions": 81
+}
