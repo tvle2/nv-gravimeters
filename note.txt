@@ -1,0 +1,535 @@
+
+
+The best design is a **dynamic Gaussian-sum branch bank with branch-local particle filters and an explicit one-step Bayesian experimental-design controller**.
+
+That is more specific than “moving branches + birth + reinit.” It means:
+
+[
+p_t(\theta);\approx;\sum_{\ell=1}^{L_t} q_{\ell,t},p_{\ell,t}(\theta),
+\qquad
+\theta=(g,\phi_{\mathrm{off}},A),
+]
+
+where each component (p_{\ell,t}) is a **local PF branch** over the full parameter vector, and the branch bank is controlled by a **moving Gaussian envelope primarily along (g)**. This is exactly the direction suggested by the paper’s supplement: for multimodal posteriors, a single PF is structurally weak, and a bank of filters with different priors is the natural remedy; fixed mixture locations give only limited resolution, while allowing the component locations and scales to move turns the update into a nonlinear mixture-tracking problem. ([ar5iv][1])
+
+For your physical model, that hybrid is better than either extreme:
+
+* **better than one global PF** because your likelihood is oscillatory in (g), so the posterior can have multiple separated gravity aliases;
+* **better than a pure Gaussian mixture** because within each branch the model is still nonlinear and coupled through (\phi_{\text{off}}), (A), and visibility/noise effects;
+* **better than your current fixed-slot bank** because your current bank is still a bank of **pre-seeded (g)-regions**, not a bank of **evolving hypotheses**. Your code literally defines a “fixed-slot multi-PF bank,” seeds slots by a fixed (g)-spread parameter, and still scores performance by the global mixture mean, which is exactly the failure mode the supplement warns about.   
+
+---
+
+## Why this is the right design for *your* physical model
+
+Your gravimeter is stateless/projective at the measurement-loop level: the next outcome depends on the current control and latent parameters, not on a hidden probe trajectory. The model is Bernoulli with
+
+[
+p(y=1\mid \theta,x)
+===================
+
+\frac12\left[1+V(T,B),A\cos!\big((1+\varepsilon)k_g(T,B)g+\phi_{\text{off}}+\psi\big)\right],
+]
+
+with controls (x=(T_s,B'*p,\psi)) and latent parameters (\theta=(g,\phi*{\text{off}},A)). In your code, that is exactly the gravimeter likelihood and simulator structure.  
+
+That matters because it tells us the posterior geometry is not arbitrary:
+
+* the multimodality is driven **primarily by wrapped phase in (g)** through (k_g(T,B),g);
+* (\phi_{\text{off}}) is a **circular nuisance parameter** coupled to (g) through the same phase;
+* (A) is mainly an **amplitude/visibility nuisance parameter**;
+* resource cost is explicit through the cycle time, so controls should be chosen by **information gained per resource**, not per step.  
+
+So the correct architecture should be **multimodal mainly along (g)**, but still keep **full local PFs over ((g,\phi_{\text{off}},A))** inside each branch.
+
+That is why the best design is **not**:
+
+* a fixed grid over (g),
+* not a full unconstrained PF bank in raw 3D without structure,
+* and not a pure Gaussian-mixture-only filter.
+
+It should be a **branch bank over (g)-modes with local PF branches over the full latent state**.
+
+---
+
+# Detailed architecture
+
+## 1) Posterior representation
+
+Represent the posterior as a mixture of branch posteriors:
+
+[
+p_t(\theta)
+\approx
+\sum_{\ell=1}^{L_t} q_{\ell,t},p_{\ell,t}(\theta),
+\qquad
+\sum_{\ell=1}^{L_t} q_{\ell,t}=1.
+]
+
+Here:
+
+* (q_{\ell,t}) is the posterior probability that branch (\ell) is the correct mode;
+* (p_{\ell,t}(\theta)) is the local posterior within that mode.
+
+Each branch is represented by particles:
+
+[
+p_{\ell,t}(\theta)\approx \sum_{n=1}^{N_\ell} w_{\ell,n,t},\delta(\theta-\theta_{\ell,n,t}).
+]
+
+This is exactly the “multiple PFs in parallel whose union represents the full posterior” idea from the supplement, but with moving local representations rather than fixed ones. ([ar5iv][1])
+
+### Intuition
+
+A branch is not “the left bin” or “the center bin.”
+A branch means:
+
+> “One coherent explanation of the data so far.”
+
+That is the semantic unit you need.
+
+---
+
+## 2) Branch parameterization: Gaussian envelope on (g), PF inside branch
+
+For each branch (\ell), maintain:
+
+* a branch mass (q_\ell),
+* a local PF over full ((g,\phi_{\text{off}},A)),
+* branch moments
+  [
+  \mu^g_\ell,;\sigma^g_\ell,;\mu^\phi_\ell,;\mu^A_\ell,
+  ]
+* and an **envelope** over (g), typically
+  [
+  \mathcal N(g;\mu^g_\ell,(\sigma^g_\ell)^2).
+  ]
+
+The Gaussian is **not** the full posterior model. It is the **branch envelope** used for:
+
+* birth,
+* merge,
+* overlap tests,
+* controller summaries,
+* and compact branch bookkeeping.
+
+The PF inside the branch carries the real nonlinear local posterior.
+
+### Why this hybrid is best
+
+The supplement’s “sum of Gaussians” idea is right at the mixture level, but for your gravimeter the branch-internal geometry is not well captured by a Gaussian alone, because the likelihood still depends nonlinearly on
+[
+k_g(T,B)g+\phi_{\text{off}}.
+]
+So the best architecture is a **Gaussian-sum *bank*** with **particle branches**, not a Gaussian-sum-only filter. ([ar5iv][1])
+
+---
+
+## 3) Branch update
+
+For a chosen control (x_t) and observed outcome (y_t), branch (\ell) is updated internally by the usual Bayes rule:
+
+[
+\tilde w_{\ell,n,t+1}
+=====================
+
+w_{\ell,n,t},p(y_t\mid x_t,\theta_{\ell,n,t}),
+\qquad
+w_{\ell,n,t+1}
+==============
+
+\frac{\tilde w_{\ell,n,t+1}}{\sum_n \tilde w_{\ell,n,t+1}}.
+]
+
+The branch evidence is
+
+[
+Z_{\ell,t}(x_t,y_t)
+===================
+
+\sum_n w_{\ell,n,t},p(y_t\mid x_t,\theta_{\ell,n,t}).
+]
+
+The branch probability update is then
+
+[
+q_{\ell,t+1}
+============
+
+\frac{q_{\ell,t},Z_{\ell,t}(x_t,y_t)}
+{\sum_j q_{j,t},Z_{j,t}(x_t,y_t)}.
+]
+
+This separates:
+
+* **within-branch inference**: particle update inside a hypothesis
+* **between-branch inference**: evidence competition between hypotheses
+
+That separation is the key thing your current architecture still muddles.
+
+---
+
+## 4) Selective resampling inside branches
+
+The paper notes that resampling is delicate and that resampling too early distorts the posterior; it also notes that selective resampling would be an improvement over “resample everyone together.”  
+
+For the quality-first design, resampling should be:
+
+* **branch-local**
+* and **ESS-triggered per branch**
+
+So branch (\ell) is resampled only when
+
+[
+\mathrm{ESS}_\ell
+=================
+
+\frac{1}{\sum_n w_{\ell,n}^2}
+]
+drops below a threshold.
+
+This is much better than any mechanism that keeps branches synchronized as a batch artifact.
+
+### Intuition
+
+Each branch is its own local posterior object.
+It should collapse, diffuse, and resample on its own schedule.
+
+---
+
+## 5) Birth: residual-based mode discovery
+
+This is one of the most important steps.
+
+Let the bank-implied marginal over (g) be
+
+[
+\hat p_t(g)
+===========
+
+\sum_{\ell=1}^{L_t} q_{\ell,t},\hat p_{\ell,t}(g),
+]
+
+where (\hat p_{\ell,t}(g)) is either:
+
+* a KDE from branch particles,
+* or the branch Gaussian envelope.
+
+Now define the **currently explained mixture envelope**
+
+[
+\hat p^{\text{env}}_t(g)
+========================
+
+\sum_{\ell=1}^{L_t} q_{\ell,t},
+\mathcal N(g;\mu^g_{\ell,t},(\sigma^g_{\ell,t})^2).
+]
+
+The residual unexplained mass is
+
+[
+r_t(g)=\big[\hat p_t(g)-\hat p^{\text{env}}*t(g)\big]*+.
+]
+
+If (r_t(g)) has a local maximum with enough mass and enough separation from existing branches, spawn a new branch centered at
+
+[
+g_\star = \arg\max_g r_t(g).
+]
+
+### How to initialize the new branch
+
+Initialize a new local PF using:
+
+* (g) concentrated around (g_\star),
+* (\phi_{\text{off}}) and (A) either:
+
+  * inherited from nearby posterior particles,
+  * or sampled from a conditional local proposal.
+
+This is the crucial difference from your current design.
+An inactive slot is not reactivated at a fixed preset location.
+It is reinitialized **where the unexplained posterior mass actually is**.
+
+### Intuition
+
+Birth should answer:
+
+> “What plausible explanation is missing from the bank?”
+
+not:
+
+> “Can I split one pre-existing slot?”
+
+---
+
+## 6) Merge
+
+Branches (\ell) and (m) should merge when they represent essentially the same hypothesis.
+
+A good merge test is based on:
+
+* overlap in (g)-envelopes,
+* circular phase closeness,
+* (A)-closeness,
+* and ideally similarity in predicted outcome probabilities under relevant controls.
+
+For example, merge if:
+
+[
+D_{\text{Bhat}}(\mathcal N_\ell,\mathcal N_m) < \tau_g,
+]
+[
+d_{\mathbb S^1}(\mu^\phi_\ell,\mu^\phi_m) < \tau_\phi,
+]
+[
+|\mu^A_\ell-\mu^A_m| < \tau_A.
+]
+
+Then form the merged branch by:
+
+* combining branch masses,
+* pooling particles,
+* resampling a new local PF from the union.
+
+### Intuition
+
+Merge should mean:
+
+> “These two branches no longer correspond to distinguishable explanations.”
+
+---
+
+## 7) Prune
+
+If a branch remains low-mass for long enough, prune it:
+
+[
+q_{\ell,t}<\tau_{\text{prune}}
+\quad\text{for }P\text{ consecutive steps}.
+]
+
+Use patience, not instantaneous pruning, because transient evidence dips are normal.
+
+### Intuition
+
+Prune says:
+
+> “This hypothesis has effectively lost the competition.”
+
+---
+
+## 8) Reinitialization of inactive slots
+
+Inactive slots are not dead memory. They are **capacity for future modes**.
+
+When birth happens, an inactive slot is reinitialized from the residual mode.
+That means inactive slots should not retain stale geometry from old branches.
+
+This is the correct use of fixed-capacity memory.
+
+---
+
+# Controller architecture
+
+Here is where quality-first design differs most from your current approach.
+
+## 9) The controller should not reason over all branches symmetrically
+
+Your current bank-aware controller still aggregates a lot of information through a softened branch average and global mixture summary. That is why it tends to learn a compromise policy instead of a mode-discriminating one. The current code explicitly feeds global summaries, top-two-gap-like signals, and per-slot branch summaries into a controller, while evaluation is still based on the global mixture mean.  
+
+For a high-quality architecture, the controller should focus on the **top active ambiguities**:
+
+* branch 1,
+* branch 2,
+* maybe branch 3 if needed.
+
+Because a Bernoulli measurement gives only one bit per shot.
+Trying to optimize equally over 5 tiny branches is usually wasteful.
+
+---
+
+## 10) Best controller objective: one-step Bayes design, not pure end-to-end RL
+
+Because your physical model is known and the outcome is binary, the cleanest quality-first control architecture is:
+
+### choose (x_t) by maximizing a one-step expected utility
+
+[
+x_t^\star = \arg\max_x U_t(x).
+]
+
+The best utility for your problem is a **mixture of refinement and discrimination**:
+
+[
+U_t(x)
+======
+
+-\lambda_{\text{risk}}
+\underbrace{
+\mathbb E_{y\sim p(y|x,\mathcal B_t)}
+\Big[
+\mathrm{tr}(G,\Sigma_{t+1}(y;x))
+\Big]
+}*{\text{expected posterior risk}}
++
+\lambda*{\text{disc}}
+\underbrace{
+I(B_t;Y_{t+1}\mid x,\mathcal B_t)
+}_{\text{branch discrimination}}
+\Big/
+c(x),
+]
+
+where:
+
+* (\mathcal B_t) is the current branch bank,
+* (B_t) is the discrete branch index,
+* (Y_{t+1}\in{0,1}),
+* (G) is your nuisance-weighting matrix,
+* (c(x)) is the resource cost (cycle time).
+
+Because the measurement is Bernoulli, the branch-information term has a very simple form.
+
+Let
+
+[
+\pi_\ell(x)=\mathbb E_{p_{\ell,t}(\theta)}[p(Y=1\mid \theta,x)],
+]
+[
+\bar\pi(x)=\sum_\ell q_\ell \pi_\ell(x).
+]
+
+Then
+
+[
+I(B;Y\mid x)
+============
+
+## h(\bar\pi(x))
+
+\sum_\ell q_\ell,h(\pi_\ell(x)),
+]
+
+where (h(p)=-p\log p-(1-p)\log(1-p)) is Bernoulli entropy.
+
+### Why this is so important
+
+This term explicitly rewards controls that make competing branches predict different outcomes.
+
+That is exactly what your current learned controller is *not* directly trained to do.
+
+---
+
+## 11) Resource-normalized design is essential
+
+Your gravimeter resource count is cycle-time-based, not step-based. In the code, used resources are incremented by the cycle time derived from (T_s). 
+
+So the controller should maximize **information per resource**, not raw information per shot.
+
+That means a long (T_s) is only good if the increased sensitivity is worth the extra time.
+
+This matters a lot because (k_g(T,B)) scales nonlinearly with (T_s) and (B'_p), while cost also grows with (T_s).
+
+---
+
+## 12) Microwave phase should be optimized for branch discrimination or branch refinement
+
+Because your likelihood is
+[
+\frac12[1+V A\cos(k_g g+\phi_{\text{off}}+\psi)],
+]
+the phase control (\psi) is special.
+
+For local refinement of a dominant branch, you want near-quadrature operation.
+
+For discriminating two top branches (\ell_1,\ell_2), you want (\psi) such that
+
+[
+|\pi_{\ell_1}(x)-\pi_{\ell_2}(x)|
+]
+is large.
+
+So in a quality-first architecture, I would not let the NN “freely discover” phase from scratch. I would compute (\psi) by either:
+
+* direct 1D optimization inside the candidate-control search,
+* or an analytic/quadrature-style rule conditioned on the top ambiguity.
+
+This is a model-based advantage you should exploit.
+
+---
+
+# Best initialization for branches
+
+## 13) Branch centers should be physics-informed, not uniformly spaced
+
+A very important physical insight:
+
+The multimodality in (g) is induced by phase wrapping in
+[
+k_g(T,B),g+\phi_{\text{off}}+\psi.
+]
+
+So the characteristic alias spacing in (g) is approximately
+
+[
+\Delta g \approx \frac{2\pi}{k_g(T,B)}.
+]
+
+That means branch placement should be tied to plausible phase-wrap spacing under informative controls, not an arbitrary uniform grid over the prior.
+
+### Better initialization
+
+Choose a reference informative control (x_{\text{ref}}), compute (k_{\text{ref}}=k_g(x_{\text{ref}})), and seed branch centers roughly one alias spacing apart:
+
+[
+\mu^g_\ell \approx g_0 + m_\ell \frac{2\pi}{k_{\text{ref}}}.
+]
+
+This is physically meaningful.
+It is much better than “5 evenly spaced slots in the prior.”
+
+---
+
+# Final recommendation
+
+If quality is the goal, then the best architecture is:
+
+## Dynamic Gaussian-sum branch bank + branch-local PFs + exact one-step Bayes control
+
+### Posterior layer
+
+[
+p_t(\theta)\approx \sum_\ell q_{\ell,t} p_{\ell,t}(\theta)
+]
+with moving branch envelopes in (g) and local PFs over full ((g,\phi_{\text{off}},A)).
+
+### Lifecycle layer
+
+* birth from residual unexplained (g)-mass
+* merge by overlap/similarity
+* prune by low evidence with patience
+* inactive-slot reinit at actual residual modes
+
+### Control layer
+
+[
+x_t^\star = \arg\max_x
+\frac{
+-\lambda_{\text{risk}}\mathbb E_y[\mathrm{tr}(G\Sigma_{t+1}(y;x))]
++\lambda_{\text{disc}} I(B;Y|x)
+}{
+c(x)
+}
+]
+
+### Physics exploitation
+
+* branch initialization based on alias spacing (2\pi/k_g)
+* phase chosen to maximize local slope or top-branch discrimination
+* resource normalization by cycle time
+
+That is the most intuitive, technically sound, and physically matched design for your case.
+
+
+[1]: https://ar5iv.labs.arxiv.org/html/2312.16985?utm_source=chatgpt.com "Model-aware reinforcement learning for high-performance ..."
