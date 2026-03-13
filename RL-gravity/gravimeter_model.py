@@ -149,20 +149,20 @@ class GravimeterConfig:
 
     # parameter priors / admissible ranges
     g_range: tuple[float, float] = (9.7639, 9.8337)
-    phi_off_range: tuple[float, float] = (-pi, pi)
-    A_range: tuple[float, float] = (0.45, 1.0)
+    phi_off_range: tuple[float, float] = (-pi/2, pi/2)
+    A_range: tuple[float, float] = (0.80, 1.0)
 
     # control ranges
-    T_range_s: tuple[float, float] = (50e-6, 1.0e-3)
-    Bp_range_kTm: tuple[float, float] = (0.5, 50.0)
-    delta_max_rad: float = pi / 3.0
+    T_range_s: tuple[float, float] = (1.0e-4, 8.0e-4)
+    Bp_range_kTm: tuple[float, float] = (2.0, 50.0)
+    delta_max_rad: float = pi / 4.0
 
     # hidden-noise model for true measurement simulation
     mfg_rel_noise_bound: float = 0.05
-    mfg_noise_quad_points: int = 9
-    sigma_omega_rel: float = 0.003
+    mfg_noise_quad_points: int = 17 # 17 for pilot run, 21 for full run
+    sigma_omega_rel: float = 0.001
     trap_visibility_mode: str = "exact_single_delta"   # none | small_noise_avg | exact_single_delta
-    T2_spin_s: Optional[float] = 0.015
+    T2_spin_s: Optional[float] = None
     readout_flip_prob: float = 0.0
 
     # resource model

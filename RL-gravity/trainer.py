@@ -60,13 +60,13 @@ PILOT_PROFILE = RunProfile(
     out_dir="runs/gravimeter_branchbank_pilot",
 
     batchsize=128,
-    iterations=2000,
+    iterations=3000,
     interval_save=128,
-    max_steps=128,
-    max_resources=0.6,
+    max_steps=512,
+    max_resources=1.0,
     initial_lr=3e-4,
     seed=123,
-    gradient_accumulation=2,
+    gradient_accumulation=4,
 
     num_branches=4,
     particles_per_branch=256,
@@ -74,8 +74,8 @@ PILOT_PROFILE = RunProfile(
     init_mode="stratified_g",
     hidden_sizes=(128, 128, 128, 128),
 
-    control_history_iters=32,
-    eval_iters=64,
+    control_history_iters=64,
+    eval_iters=512,
     plots_bins=40,
 )
 
@@ -167,7 +167,7 @@ def build_untrained_stack(profile: RunProfile, cfg: GravimeterConfig, bank_cfg: 
         max_resources=profile.max_resources,
         initial_lr=profile.initial_lr,
         cov_weight_matrix=cov_weight_matrix,
-        cumulative_loss=True,
+        cumulative_loss=False,
         loss_logl_outcomes=True,
         baseline_correction=True,
         pf_gamma=1.0,
