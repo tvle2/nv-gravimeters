@@ -31,9 +31,9 @@ RUN_MODE = "all"        # "all" | "train-only" | "eval-only" | "plots-only"
 OBJECTIVE_MODE = "gravity_only"   # "gravity_only" or "joint"
 EVAL_METRIC_MODE = "g_only"   # "g_only" or "same_as_training"
 TRAIN_CUMULATIVE_LOSS = True
-TRAIN_LOG_LOSS = False
-PF_BETA = 0.98
-PF_GAMMA = 0.95
+TRAIN_LOG_LOSS = True
+PF_BETA = 0.99
+PF_GAMMA = 0.98
 
 # =============================================================================
 # PROFILE DEFINITION

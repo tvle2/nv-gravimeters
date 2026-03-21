@@ -883,10 +883,20 @@ class BranchAwareGravityControlStrategy(Model):
             h = layer(h)
         return h
     
-    def _map_log_interval(self, z: Tensor, low: float, high: float) -> Tensor:
+    # def _map_log_interval(self, z: Tensor, low: float, high: float) -> Tensor:
+    #     lo = tf.cast(tf.math.log(low), z.dtype)
+    #     hi = tf.cast(tf.math.log(high), z.dtype)
+    #     return tf.exp(lo + 0.5 * (z + 1.0) * (hi - lo))
+    
+    
+    def _map_log_interval(self, z: Tensor, low: float, high: float, power: float = 2.0) -> Tensor:
+        u = 0.5 * (z + 1.0)
+        u = tf.clip_by_value(u, 0.0, 1.0)
+        u_warped = tf.pow(u, tf.cast(power, z.dtype))
+
         lo = tf.cast(tf.math.log(low), z.dtype)
         hi = tf.cast(tf.math.log(high), z.dtype)
-        return tf.exp(lo + 0.5 * (z + 1.0) * (hi - lo))
+        return tf.exp(lo + u_warped * (hi - lo))
 
     def _split_input(self, input_strategy: Tensor):
         branch_flat = input_strategy[:, : self.L * self.FEATS_PER_BRANCH]
@@ -963,8 +973,8 @@ class BranchAwareGravityControlStrategy(Model):
 
         # --- 5. Decoding Controls T_k and B'_k ---
         # Raw network controls mapped to physical logarithmic ranges. 
-        T_s = self._map_log_interval(zT, self.cfg.T_range_s[0], self.cfg.T_range_s[1])
-        Bp_kTm = self._map_log_interval(zB, self.cfg.Bp_range_kTm[0], self.cfg.Bp_range_kTm[1])
+        T_s = self._map_log_interval(zT, self.cfg.T_range_s[0], self.cfg.T_range_s[1], power=2.0)
+        Bp_kTm = self._map_log_interval(zB, self.cfg.Bp_range_kTm[0], self.cfg.Bp_range_kTm[1], power=2.5)
 
         mean_g_pm1 = branch_block[:, :, 1]
         mean_A_pm1 = branch_block[:, :, 2]
