@@ -141,9 +141,9 @@ FULL_PROFILE = RunProfile(
     max_resources=0.5,
     initial_lr=3e-4,
     seed=123,
-    gradient_accumulation=16, #8,12
+    gradient_accumulation=6, #8,12, 16
 
-    num_branches=6,
+    num_branches=4,
     particles_per_branch=512,
     init_mode="stratified_g",
     hidden_sizes=(128,128, 128),

@@ -973,8 +973,8 @@ class BranchAwareGravityControlStrategy(Model):
 
         # --- 5. Decoding Controls T_k and B'_k ---
         # Raw network controls mapped to physical logarithmic ranges. 
-        T_s = self._map_log_interval(zT, self.cfg.T_range_s[0], self.cfg.T_range_s[1], power=2.0)
-        Bp_kTm = self._map_log_interval(zB, self.cfg.Bp_range_kTm[0], self.cfg.Bp_range_kTm[1], power=2.5)
+        T_s = self._map_log_interval(zT, self.cfg.T_range_s[0], self.cfg.T_range_s[1], power=2.5)
+        Bp_kTm = self._map_log_interval(zB, self.cfg.Bp_range_kTm[0], self.cfg.Bp_range_kTm[1], power=3.0)
 
         mean_g_pm1 = branch_block[:, :, 1]
         mean_A_pm1 = branch_block[:, :, 2]
