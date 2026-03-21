@@ -30,7 +30,7 @@ RUN_PROFILE = "full"   # "pilot" or "full"
 RUN_MODE = "all"        # "all" | "train-only" | "eval-only" | "plots-only"
 OBJECTIVE_MODE = "gravity_only"   # "gravity_only" or "joint"
 EVAL_METRIC_MODE = "g_only"   # "g_only" or "same_as_training"
-TRAIN_CUMULATIVE_LOSS = False
+TRAIN_CUMULATIVE_LOSS = True
 TRAIN_LOG_LOSS = False
 PF_BETA = 0.95
 PF_GAMMA = 0.85
@@ -157,7 +157,7 @@ FULL_PROFILE = RunProfile(
     out_dir="runs/gravimeter_branchbank_full_gA_direct3head_gonly_v6",
 
     batchsize=16,
-    iterations=2000,
+    iterations=4096,
     interval_save=16,
     max_steps=900,
     max_resources=0.5,

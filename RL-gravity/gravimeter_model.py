@@ -543,7 +543,7 @@ class GravityBranchBankParticleFilter(ParticleFilter):
         # )
 
         resample_flag = tf.reduce_any(branch_mask)
-        
+
         def _do_resample():
             wloc_prop, pbank_prop = self._resample_all_branches(wloc, pbank, rangen)
 
@@ -910,52 +910,16 @@ class BranchAwareGravityControlStrategy(Model):
             8.0 * tf.cast(pi, T_s.dtype) * ge / (w ** 3)
         ) * Bp_T_per_m
     
-    def _apply_disambiguation_ceiling(
-        self,
-        T_s: Tensor,
-        Bp_kTm: Tensor,
-        qgap01: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        """
-        Ambiguity-dependent control ceiling.
-
-        qgap01:
-            0 -> top-2 branch masses are equal   -> highly ambiguous
-            1 -> one branch clearly dominates    -> largely resolved
-
-        When ambiguity is high, keep T and B small to avoid phase aliasing:
-            k_g * Δg should stay O(1), not hundreds of radians.
-
-        When ambiguity is low, release the ceiling and allow larger-sensitivity
-        controls.
-        """
-        need_disc = tf.clip_by_value(1.0 - qgap01, 0.0, 1.0)   # 1=ambiguous, 0=resolved
-        resolved = 1.0 - need_disc                             # 0=ambiguous, 1=resolved
-        
-        # Slower release than a linear ramp.
-        release = tf.square(resolved)
-
-        logT_lo = tf.cast(tf.math.log(self.cfg.T_range_s[0]), T_s.dtype)
-        logT_hi = tf.cast(tf.math.log(self.cfg.T_range_s[1]), T_s.dtype)
-        logB_lo = tf.cast(tf.math.log(self.cfg.Bp_range_kTm[0]), Bp_kTm.dtype)
-        logB_hi = tf.cast(tf.math.log(self.cfg.Bp_range_kTm[1]), Bp_kTm.dtype)
-
-        # Ceiling is smallest when ambiguous, largest when resolved.
-        T_ceil = tf.exp(logT_lo + release * (logT_hi - logT_lo))
-        B_ceil = tf.exp(logB_lo + release * (logB_hi - logB_lo))
-
-        T_s = tf.minimum(T_s, T_ceil)
-        Bp_kTm = tf.minimum(Bp_kTm, B_ceil)
-
-        return T_s, Bp_kTm, need_disc
 
     def call(self, input_strategy: Tensor) -> Tensor:
         branch_block, q, extras = self._split_input(input_strategy)
 
+        # --- 1. Branch Encoder ---
         h = branch_block
         for layer in self.branch_layers:
             h = layer(h)
 
+        # --- 2. Pooling & Dominant Branch Comparison ---
         h_flat = tf.reshape(h, (tf.shape(h)[0], self.L * tf.shape(h)[2]))
         weighted_pool = tf.reduce_sum(q[:, :, None] * h, axis=1)
         max_pool = tf.reduce_max(h, axis=1)
@@ -986,16 +950,19 @@ class BranchAwareGravityControlStrategy(Model):
             axis=1,
         )
 
+        # --- 3. Shared Trunk ---
         for layer in self.trunk_layers:
             x = layer(x)
 
         x_shared = x
 
+        # --- 4. Three Output Heads ---
         zT = self._run_head(x_shared, self.T_head_layers)
         zB = self._run_head(x_shared, self.B_head_layers)
         zD = self._run_head(x_shared, self.phi_head_layers)
 
-        # Raw network controls in physical ranges.
+        # --- 5. Decoding Controls T_k and B'_k ---
+        # Raw network controls mapped to physical logarithmic ranges. 
         T_s = self._map_log_interval(zT, self.cfg.T_range_s[0], self.cfg.T_range_s[1])
         Bp_kTm = self._map_log_interval(zB, self.cfg.Bp_range_kTm[0], self.cfg.Bp_range_kTm[1])
 
@@ -1005,54 +972,27 @@ class BranchAwareGravityControlStrategy(Model):
         mu_g = denormalize_from_minus1_plus1(mean_g_pm1, self.cfg.g_range)
         mu_A = denormalize_from_minus1_plus1(mean_A_pm1, self.cfg.A_range)
 
-        # extras[1] = QGap12 encoded to [-1, +1]
-        qgap01 = tf.clip_by_value(0.5 * (extras[:, 1:2] + 1.0), 0.0, 1.0)
-
-        T_s, Bp_kTm, need_disc = self._apply_disambiguation_ceiling(
-            T_s=T_s,
-            Bp_kTm=Bp_kTm,
-            qgap01=qgap01,
-        )
-
+        # --- 6. Branch-Aware Quadrature Lock ---
         kg = self._k_g(T_s, Bp_kTm)   # (bs, 1)
         psi = kg * mu_g               # (bs, L)
 
-        # Global phase lock.
+        # Global phase lock representing arg C_k
         c_re = tf.reduce_sum(q * mu_A * tf.cos(psi), axis=1, keepdims=True)
         c_im = tf.reduce_sum(q * mu_A * tf.sin(psi), axis=1, keepdims=True)
+        
+        # pi/2 - arg C_k(T_k, B'_k)
         phase_lock_global = wrap_to_pi_tf(
             tf.cast(pi / 2.0, c_re.dtype) - tf.atan2(c_im, c_re)
         )
 
-        # Top-2 branch discriminative lock.
-        if self.L > 1:
-            top2_mu_g = tf.gather(mu_g, order[:, :2], batch_dims=1)   # (bs, 2)
-            psi_top2 = kg * top2_mu_g                                 # (bs, 2)
-
-            # Circular geodesic midpoint between the top-2 branch phases.
-            dpsi = wrap_to_pi_tf(psi_top2[:, 0:1] - psi_top2[:, 1:2])
-            psi_disc_mid = wrap_to_pi_tf(psi_top2[:, 1:2] + 0.5 * dpsi)
-
-            phase_lock_disc = wrap_to_pi_tf(
-                tf.cast(pi / 2.0, psi_disc_mid.dtype) - psi_disc_mid
-            )
-        else:
-            phase_lock_disc = phase_lock_global
-
-        gate = need_disc
-
-        phase_target = wrap_to_pi_tf(
-            tf.atan2(
-                (1.0 - gate) * tf.sin(phase_lock_global) + gate * tf.sin(phase_lock_disc),
-                (1.0 - gate) * tf.cos(phase_lock_global) + gate * tf.cos(phase_lock_disc),
-            )
-        )
-
+        # Learned residual detuning from the neural network head
         delta = tf.cast(self.cfg.delta_max_rad, zD.dtype) * zD
-        mw_phase = wrap_to_pi_tf(phase_target + delta)
+        
+        # Final MW Phase
+        # The top-2 discriminative lock interpolation heuristic is completely removed.
+        mw_phase = wrap_to_pi_tf(phase_lock_global + delta)
 
         return tf.concat([T_s, Bp_kTm, mw_phase], axis=1)
-
 # -----------------------------------------------------------------------------
 # Builders
 # -----------------------------------------------------------------------------
