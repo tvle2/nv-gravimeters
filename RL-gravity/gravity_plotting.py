@@ -1,4 +1,4 @@
-# graph_plotting.py
+# gravity_plotting.py
 from __future__ import annotations
 
 """
@@ -52,6 +52,7 @@ def _resource_binned_mean(df: pd.DataFrame, x: str, y: str, bins: int = 40) -> p
     edges = np.linspace(np.min(xvals), np.max(xvals), bins + 1)
     ids = np.digitize(xvals, edges) - 1
     ids = np.clip(ids, 0, bins - 1)
+
     out = pd.DataFrame({x: xvals, y: yvals, "_bin": ids})
     out = out.groupby("_bin")[[x, y]].mean().reset_index(drop=True)
     return out.sort_values(x).reset_index(drop=True)
@@ -70,11 +71,16 @@ def _branch_columns(df: pd.DataFrame, suffix: str) -> list[str]:
     return out
 
 
-def _save_line(df: pd.DataFrame, x: str, y: str, out_path: Path, *, logy: bool = False, title: str = "") -> None:
+def _save_line(df: pd.DataFrame, x: str, y: str, out_path: Path, *, logy: bool = True, title: str = "") -> None:
     if x not in df.columns or y not in df.columns or len(df) == 0:
         return
+
+    plot_df = df[[x, y]].replace([np.inf, -np.inf], np.nan).dropna()
+    if len(plot_df) == 0:
+        return
+
     fig, ax = plt.subplots(figsize=(5.5, 3.8), dpi=180)
-    ax.plot(df[x], df[y], linewidth=1.6)
+    ax.plot(plot_df[x], plot_df[y], linewidth=1.6)
     ax.set_xlabel(x)
     ax.set_ylabel(y)
     if title:
@@ -90,9 +96,11 @@ def _save_line(df: pd.DataFrame, x: str, y: str, out_path: Path, *, logy: bool =
 def _save_scatter(df: pd.DataFrame, x: str, y: str, c: str, out_path: Path, *, title: str = "") -> None:
     if not {x, y, c}.issubset(df.columns) or len(df) == 0:
         return
+
     plot_df = df[[x, y, c]].replace([np.inf, -np.inf], np.nan).dropna()
     if len(plot_df) == 0:
         return
+
     fig, ax = plt.subplots(figsize=(5.5, 3.8), dpi=180)
     sc = ax.scatter(plot_df[x], plot_df[y], c=plot_df[c], s=10, alpha=0.7)
     ax.set_xlabel(x)
@@ -107,13 +115,32 @@ def _save_scatter(df: pd.DataFrame, x: str, y: str, c: str, out_path: Path, *, t
     plt.close(fig)
 
 
-def _save_multiline(curves: list[pd.DataFrame], labels: list[str], x: str, y: str, out_path: Path, *, title: str = "") -> None:
+def _save_multiline(
+    curves: list[pd.DataFrame],
+    labels: list[str],
+    x: str,
+    y: str,
+    out_path: Path,
+    *,
+    title: str = "",
+) -> None:
     if not curves:
         return
+
     fig, ax = plt.subplots(figsize=(6.2, 4.0), dpi=180)
+    plotted_any = False
+
     for df, label in zip(curves, labels):
         if x in df.columns and y in df.columns and len(df) > 0:
-            ax.plot(df[x], df[y], linewidth=1.4, label=label)
+            plot_df = df[[x, y]].replace([np.inf, -np.inf], np.nan).dropna()
+            if len(plot_df) > 0:
+                ax.plot(plot_df[x], plot_df[y], linewidth=1.4, label=label)
+                plotted_any = True
+
+    if not plotted_any:
+        plt.close(fig)
+        return
+
     ax.set_xlabel(x)
     ax.set_ylabel(y)
     if title:
@@ -141,15 +168,61 @@ def plot_branchbank_run(run_dir: str | Path, *, bins: int = 40) -> Path:
             hist_df["Checkpoint"] = np.arange(1, len(hist_df) + 1, dtype=np.int64)
         for candidate in ["Loss", "MeanLoss", hist_df.columns[1] if len(hist_df.columns) > 1 else None]:
             if candidate is not None and candidate in hist_df.columns:
-                _save_line(hist_df, "Checkpoint", candidate, plot_dir / "training_loss.png", logy=False, title="Training history")
+                plot_df = hist_df[["Checkpoint", candidate]].replace([np.inf, -np.inf], np.nan).dropna()
+                if len(plot_df) == 0:
+                    break
+
+                y = plot_df[candidate].to_numpy(dtype=float)
+                x = plot_df["Checkpoint"].to_numpy(dtype=float)
+
+                smooth_window = max(3, min(9, len(plot_df) // 4))
+                y_smooth = pd.Series(y).rolling(window=smooth_window, min_periods=1).mean().to_numpy()
+
+                fig, ax = plt.subplots(figsize=(5.5, 3.8), dpi=180)
+                ax.plot(x, y, linewidth=1.0, alpha=0.35, label="raw")
+                ax.plot(x, y_smooth, linewidth=2.0, label=f"{smooth_window}-pt moving avg")
+                ax.set_xlabel("Checkpoint")
+                ax.set_ylabel(candidate)
+                ax.set_title("Training history")
+                ax.grid(True, alpha=0.3)
+                ax.legend(fontsize=8, loc="best")
+                fig.tight_layout()
+                fig.savefig(plot_dir / "training_loss.png")
+                plt.close(fig)
                 break
+    # # ---------------- evaluation ----------------
+    # if eval_csv is not None and eval_csv.exists():
+    #     eval_df = pd.read_csv(eval_csv)
+    #     if {"Resources", "Weighted MSE"}.issubset(eval_df.columns):
+    #         mean_df = _resource_binned_mean(eval_df, "Resources", "Weighted MSE", bins=bins)
+    #         _save_line(
+    #             mean_df,
+    #             "Resources",
+    #             "Weighted MSE",
+    #             plot_dir / "precision_vs_resources.png",
+    #             logy=False,
+    #             title="Weighted MSE vs resources",
+    #         )
 
     # ---------------- evaluation ----------------
     if eval_csv is not None and eval_csv.exists():
         eval_df = pd.read_csv(eval_csv)
-        if {"Resources", "Weighted MSE"}.issubset(eval_df.columns):
-            mean_df = _resource_binned_mean(eval_df, "Resources", "Weighted MSE", bins=bins)
-            _save_line(mean_df, "Resources", "Weighted MSE", plot_dir / "precision_vs_resources.png", logy=False, title="Weighted MSE vs resources")
+
+        metric_col = None
+        for candidate in ["MSE_g", "Weighted MSE"]:
+            if {"Resources", candidate}.issubset(eval_df.columns):
+                metric_col = candidate
+                break
+
+        if metric_col is not None:
+            mean_df = _resource_binned_mean(eval_df, "Resources", metric_col, bins=bins)
+            _save_line(
+                mean_df,
+                "Resources",
+                metric_col,
+                plot_dir / "precision_vs_resources.png",
+                logy=True,
+            )
 
     # ---------------- controls / branch summaries ----------------
     if control_csv is not None and control_csv.exists():
@@ -164,25 +237,94 @@ def plot_branchbank_run(run_dir: str | Path, *, bins: int = 40) -> Path:
             _save_line(df_b, "ResOverMaxRes", "Bp_kTm", plot_dir / "Bp_vs_resources.png", title="MFG vs resources")
 
         if {"ResOverMaxRes", "mw_phase_rad", "BranchDominance"}.issubset(ctrl_df.columns):
-            _save_scatter(ctrl_df, "ResOverMaxRes", "mw_phase_rad", "BranchDominance", plot_dir / "mw_phase_scatter.png", title="Readout phase vs resources")
+            _save_scatter(
+                ctrl_df,
+                "ResOverMaxRes",
+                "mw_phase_rad",
+                "BranchDominance",
+                plot_dir / "mw_phase_scatter.png",
+                title="Readout phase vs resources",
+            )
 
         if {"ResOverMaxRes", "BranchEntropy"}.issubset(ctrl_df.columns):
             df_ent = _resource_binned_mean(ctrl_df, "ResOverMaxRes", "BranchEntropy", bins=bins)
-            _save_line(df_ent, "ResOverMaxRes", "BranchEntropy", plot_dir / "branch_entropy_vs_resources.png", title="Branch entropy vs resources")
+            _save_line(
+                df_ent,
+                "ResOverMaxRes",
+                "BranchEntropy",
+                plot_dir / "branch_entropy_vs_resources.png",
+                title="Branch entropy vs resources",
+            )
+
+        if {"ResOverMaxRes", "QGap12"}.issubset(ctrl_df.columns):
+            df_gap = _resource_binned_mean(ctrl_df, "ResOverMaxRes", "QGap12", bins=bins)
+            _save_line(
+                df_gap,
+                "ResOverMaxRes",
+                "QGap12",
+                plot_dir / "qgap12_vs_resources.png",
+                title="Top-2 branch mass gap vs resources",
+            )
 
         if {"ResOverMaxRes", "Std_g"}.issubset(ctrl_df.columns):
-            df_std = _resource_binned_mean(ctrl_df, "ResOverMaxRes", "Std_g", bins=bins)
-            _save_line(df_std, "ResOverMaxRes", "Std_g", plot_dir / "std_g_vs_resources.png", title="Global posterior std(g) vs resources")
+            df_std_g = _resource_binned_mean(ctrl_df, "ResOverMaxRes", "Std_g", bins=bins)
+            _save_line(
+                df_std_g,
+                "ResOverMaxRes",
+                "Std_g",
+                plot_dir / "std_g_vs_resources.png",
+                title="Global posterior std(g) vs resources",
+            )
 
         if {"ResOverMaxRes", "Mean_g"}.issubset(ctrl_df.columns):
-            df_mean = _resource_binned_mean(ctrl_df, "ResOverMaxRes", "Mean_g", bins=bins)
-            _save_line(df_mean, "ResOverMaxRes", "Mean_g", plot_dir / "mean_g_vs_resources.png", title="Global posterior mean(g) vs resources")
+            df_mean_g = _resource_binned_mean(ctrl_df, "ResOverMaxRes", "Mean_g", bins=bins)
+            _save_line(
+                df_mean_g,
+                "ResOverMaxRes",
+                "Mean_g",
+                plot_dir / "mean_g_vs_resources.png",
+                title="Global posterior mean(g) vs resources",
+            )
+
+        if {"ResOverMaxRes", "Std_A"}.issubset(ctrl_df.columns):
+            df_std_A = _resource_binned_mean(ctrl_df, "ResOverMaxRes", "Std_A", bins=bins)
+            _save_line(
+                df_std_A,
+                "ResOverMaxRes",
+                "Std_A",
+                plot_dir / "std_A_vs_resources.png",
+                title="Global posterior std(A) vs resources",
+            )
+
+        if {"ResOverMaxRes", "Mean_A"}.issubset(ctrl_df.columns):
+            df_mean_A = _resource_binned_mean(ctrl_df, "ResOverMaxRes", "Mean_A", bins=bins)
+            _save_line(
+                df_mean_A,
+                "ResOverMaxRes",
+                "Mean_A",
+                plot_dir / "mean_A_vs_resources.png",
+                title="Global posterior mean(A) vs resources",
+            )
 
         if {"Mean_g", "Std_g", "BranchEntropy"}.issubset(ctrl_df.columns):
-            _save_scatter(ctrl_df, "Mean_g", "Std_g", "BranchEntropy", plot_dir / "ambiguity_map.png", title="Ambiguity map")
+            _save_scatter(
+                ctrl_df,
+                "Mean_g",
+                "Std_g",
+                "BranchEntropy",
+                plot_dir / "ambiguity_map.png",
+                title="Ambiguity map",
+            )
 
-        if {"Mean_phi_off", "mw_phase_rad", "BranchDominance"}.issubset(ctrl_df.columns):
-            _save_scatter(ctrl_df, "Mean_phi_off", "mw_phase_rad", "BranchDominance", plot_dir / "phase_control_relation.png", title="Phase-control relation")
+        if {"Mean_A", "Std_A", "BranchEntropy"}.issubset(ctrl_df.columns):
+            _save_scatter(
+                ctrl_df,
+                "Mean_A",
+                "Std_A",
+                "BranchEntropy",
+                plot_dir / "A_uncertainty_map.png",
+                title="Visibility uncertainty map",
+            )
 
         # branch mass curves
         branch_mass_cols = _branch_columns(ctrl_df, "Mass")
@@ -190,10 +332,22 @@ def plot_branchbank_run(run_dir: str | Path, *, bins: int = 40) -> Path:
             curves = []
             labels = []
             for col in branch_mass_cols:
-                tmp = _resource_binned_mean(ctrl_df[["ResOverMaxRes", col]].rename(columns={col: "Mass"}), "ResOverMaxRes", "Mass", bins=bins)
+                tmp = _resource_binned_mean(
+                    ctrl_df[["ResOverMaxRes", col]].rename(columns={col: "Mass"}),
+                    "ResOverMaxRes",
+                    "Mass",
+                    bins=bins,
+                )
                 curves.append(tmp)
                 labels.append(col)
-            _save_multiline(curves, labels, "ResOverMaxRes", "Mass", plot_dir / "branch_masses.png", title="Branch masses vs resources")
+            _save_multiline(
+                curves,
+                labels,
+                "ResOverMaxRes",
+                "Mass",
+                plot_dir / "branch_masses.png",
+                title="Branch masses vs resources",
+            )
 
         # branch mean-g curves
         branch_mean_g_cols = _branch_columns(ctrl_df, "Mean_g")
@@ -201,20 +355,44 @@ def plot_branchbank_run(run_dir: str | Path, *, bins: int = 40) -> Path:
             curves = []
             labels = []
             for col in branch_mean_g_cols:
-                tmp = _resource_binned_mean(ctrl_df[["ResOverMaxRes", col]].rename(columns={col: "Mean_g"}), "ResOverMaxRes", "Mean_g", bins=bins)
+                tmp = _resource_binned_mean(
+                    ctrl_df[["ResOverMaxRes", col]].rename(columns={col: "Mean_g"}),
+                    "ResOverMaxRes",
+                    "Mean_g",
+                    bins=bins,
+                )
                 curves.append(tmp)
                 labels.append(col)
-            _save_multiline(curves, labels, "ResOverMaxRes", "Mean_g", plot_dir / "branch_mean_g.png", title="Branch mean g vs resources")
+            _save_multiline(
+                curves,
+                labels,
+                "ResOverMaxRes",
+                "Mean_g",
+                plot_dir / "branch_mean_g.png",
+                title="Branch mean g vs resources",
+            )
 
-        # branch phase curves
-        branch_mean_phi_cols = _branch_columns(ctrl_df, "Mean_phi_off")
-        if branch_mean_phi_cols and "ResOverMaxRes" in ctrl_df.columns:
+        # branch mean-A curves
+        branch_mean_A_cols = _branch_columns(ctrl_df, "Mean_A")
+        if branch_mean_A_cols and "ResOverMaxRes" in ctrl_df.columns:
             curves = []
             labels = []
-            for col in branch_mean_phi_cols:
-                tmp = _resource_binned_mean(ctrl_df[["ResOverMaxRes", col]].rename(columns={col: "Mean_phi_off"}), "ResOverMaxRes", "Mean_phi_off", bins=bins)
+            for col in branch_mean_A_cols:
+                tmp = _resource_binned_mean(
+                    ctrl_df[["ResOverMaxRes", col]].rename(columns={col: "Mean_A"}),
+                    "ResOverMaxRes",
+                    "Mean_A",
+                    bins=bins,
+                )
                 curves.append(tmp)
                 labels.append(col)
-            _save_multiline(curves, labels, "ResOverMaxRes", "Mean_phi_off", plot_dir / "branch_mean_phi.png", title="Branch mean phase offset vs resources")
+            _save_multiline(
+                curves,
+                labels,
+                "ResOverMaxRes",
+                "Mean_A",
+                plot_dir / "branch_mean_A.png",
+                title="Branch mean A vs resources",
+            )
 
     return plot_dir

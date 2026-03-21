@@ -1,4 +1,12 @@
 pl_brl/__pycache__
 RL-gravity/__pycache__
 RL-gravity/qsensoropt/__pycache__
+RL-gravity/bin
+RL-gravity/include
+RL-gravity/lib
+RL-gravity/share
+RL-gravity/runs
+RL-gravity/lib64
+RL-gravity/pyvenv.cfg
 RL-gravity/runs/gravimeter_branchbank_pilot_with_decoherent
+__pycache__/
