@@ -32,8 +32,8 @@ OBJECTIVE_MODE = "gravity_only"   # "gravity_only" or "joint"
 EVAL_METRIC_MODE = "g_only"   # "g_only" or "same_as_training"
 TRAIN_CUMULATIVE_LOSS = True
 TRAIN_LOG_LOSS = False
-PF_BETA = 0.95
-PF_GAMMA = 0.85
+PF_BETA = 0.98
+PF_GAMMA = 0.95
 
 # =============================================================================
 # PROFILE DEFINITION
@@ -130,45 +130,23 @@ PILOT_PROFILE = RunProfile(
 # )
 #################################################
 
-# FULL_PROFILE = RunProfile(
-#     name="full",
-#     out_dir="runs/gravimeter_branchbank_full_gA_direct3head_gonly_v3",
-
-#     batchsize=16,
-#     iterations=5000,
-#     interval_save=16,
-#     max_steps=768,
-#     max_resources=0.38,
-#     initial_lr=1e-4,
-#     seed=123,
-#     gradient_accumulation=4, #8,12
-
-#     num_branches=4,
-#     particles_per_branch=512,
-#     init_mode="stratified_g",
-#     hidden_sizes=(128, 192, 192, 128),
-
-#     control_history_iters=128,
-#     eval_iters=1024,
-#     plots_bins=40,
-# )
 FULL_PROFILE = RunProfile(
     name="full",
-    out_dir="runs/gravimeter_branchbank_full_gA_direct3head_gonly_v6",
+    out_dir="runs/gravimeter_branchbank_full_gA_direct3head_gonly_v7",
 
     batchsize=16,
-    iterations=4096,
-    interval_save=16,
+    iterations=5000,
+    interval_save=32,
     max_steps=900,
     max_resources=0.5,
-    initial_lr=1e-4,
+    initial_lr=3e-4,
     seed=123,
-    gradient_accumulation=8, #8,12
+    gradient_accumulation=16, #8,12
 
-    num_branches=4,
+    num_branches=6,
     particles_per_branch=512,
     init_mode="stratified_g",
-    hidden_sizes=(128, 192, 192, 128),
+    hidden_sizes=(128,128, 128),
 
     control_history_iters=128,
     eval_iters=2048,
