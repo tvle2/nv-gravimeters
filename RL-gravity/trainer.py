@@ -17,6 +17,8 @@ from gravimeter_model import (
     dump_run_config,
     default_joint_cov_weight_matrix,
     gravity_only_cov_weight_matrix,
+    training_gravity_only_cov_weight_matrix,
+    training_joint_cov_weight_matrix,
 )
 from gravity_plotting import plot_branchbank_run
 
@@ -31,9 +33,11 @@ RUN_MODE = "all"        # "all" | "train-only" | "eval-only" | "plots-only"
 OBJECTIVE_MODE = "gravity_only"   # "gravity_only" or "joint"
 EVAL_METRIC_MODE = "g_only"   # "g_only" or "same_as_training"
 TRAIN_CUMULATIVE_LOSS = True
-TRAIN_LOG_LOSS = True
-PF_BETA = 0.99
+TRAIN_LOG_LOSS = False
+PF_BETA = 0.98
 PF_GAMMA = 0.98
+TRAIN_G_LOSS_SCALE = 1.0e4
+TRAIN_A_LOSS_SCALE = 1.0e2
 
 # =============================================================================
 # PROFILE DEFINITION
@@ -169,6 +173,16 @@ def selected_eval_cov_weight_matrix():
         return selected_cov_weight_matrix()
     raise ValueError(f"Unknown EVAL_METRIC_MODE={EVAL_METRIC_MODE!r}")
 
+def selected_train_cov_weight_matrix():
+    if OBJECTIVE_MODE == "gravity_only":
+        return training_gravity_only_cov_weight_matrix(scale=TRAIN_G_LOSS_SCALE)
+    if OBJECTIVE_MODE == "joint":
+        return training_joint_cov_weight_matrix(
+            g_scale=TRAIN_G_LOSS_SCALE,
+            A_scale=TRAIN_A_LOSS_SCALE,
+        )
+    raise ValueError(f"Unknown OBJECTIVE_MODE={OBJECTIVE_MODE!r}")
+
 def make_cfg() -> GravimeterConfig:
     # Edit here if you want to override physical defaults.
     return default_cfg()
@@ -296,7 +310,7 @@ def run_profile() -> None:
             cumulative_loss=TRAIN_CUMULATIVE_LOSS,
             log_loss=TRAIN_LOG_LOSS,
             gradient_accumulation=profile.gradient_accumulation,
-            cov_weight_matrix=selected_cov_weight_matrix(),
+            cov_weight_matrix=selected_train_cov_weight_matrix(),
             pf_beta=PF_BETA,
             pf_gamma=PF_GAMMA,
         )

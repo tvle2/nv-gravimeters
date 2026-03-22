@@ -1370,6 +1370,23 @@ def gravity_only_cov_weight_matrix() -> list[list[float]]:
         [0.0, 0.0],
     ]
 
+def training_gravity_only_cov_weight_matrix(scale: float = 1.0e4) -> list[list[float]]:
+    return [
+        [scale, 0.0],
+        [0.0, 0.0],
+    ]
+
+
+def training_joint_cov_weight_matrix(
+    g_scale: float = 1.0e4,
+    A_scale: float = 1.0e2,
+) -> list[list[float]]:
+    return [
+        [g_scale, 0.0],
+        [0.0, A_scale],
+    ]
+
+
 
 def default_cfg() -> GravimeterConfig:
     return GravimeterConfig()
