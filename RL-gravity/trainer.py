@@ -136,7 +136,7 @@ PILOT_PROFILE = RunProfile(
 
 FULL_PROFILE = RunProfile(
     name="full",
-    out_dir="runs/gravimeter_branchbank_full_gA_direct3head_gonly_v7",
+    out_dir="runs/gravimeter_branchbank_full_gA_direct3head_gonly_v9",
 
     batchsize=16,
     iterations=5000,
@@ -145,7 +145,7 @@ FULL_PROFILE = RunProfile(
     max_resources=0.5,
     initial_lr=3e-4,
     seed=123,
-    gradient_accumulation=6, #8,12, 16
+    gradient_accumulation=12, #8,12, 16
 
     num_branches=4,
     particles_per_branch=512,
@@ -227,6 +227,8 @@ def save_manifest(out_dir: Path, *, cfg: GravimeterConfig, bank_cfg: BranchBankC
         train_log_loss=TRAIN_LOG_LOSS,
         pf_beta=PF_BETA,
         pf_gamma=PF_GAMMA,
+        train_g_loss_scale=TRAIN_G_LOSS_SCALE,
+        train_A_loss_scale=TRAIN_A_LOSS_SCALE,
     )
 
 

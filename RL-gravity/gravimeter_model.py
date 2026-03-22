@@ -532,7 +532,7 @@ class GravityBranchBankParticleFilter(ParticleFilter):
             active[:, None],
         )  # (bs, L)
 
-        need_run = tf.reduce_any(branch_mask, axis=1)  # (bs,)
+        # need_run = tf.reduce_any(branch_mask, axis=1)  # (bs,)
 
         # num_active = tf.cast(tf.math.count_nonzero(active), tf.float64)
         # num_trigger = tf.cast(tf.math.count_nonzero(need_run), tf.float64)
