@@ -36,8 +36,8 @@ TRAIN_CUMULATIVE_LOSS = True
 TRAIN_LOG_LOSS = False
 PF_BETA = 0.98
 PF_GAMMA = 0.98
-TRAIN_G_LOSS_SCALE = 1.0e4
-TRAIN_A_LOSS_SCALE = 1.0e2
+TRAIN_G_LOSS_SCALE = 1.0e5
+TRAIN_A_LOSS_SCALE = 1.0e3
 
 # =============================================================================
 # PROFILE DEFINITION
@@ -136,16 +136,16 @@ PILOT_PROFILE = RunProfile(
 
 FULL_PROFILE = RunProfile(
     name="full",
-    out_dir="runs/gravimeter_branchbank_full_gA_direct3head_gonly_v9",
+    out_dir="runs/gravimeter_branchbank_full_gA_direct3head_gonly_v12",
 
     batchsize=16,
-    iterations=5000,
+    iterations=4000,
     interval_save=32,
-    max_steps=900,
+    max_steps=910,
     max_resources=0.5,
     initial_lr=3e-4,
     seed=123,
-    gradient_accumulation=12, #8,12, 16
+    gradient_accumulation=8, #8,12, 16
 
     num_branches=4,
     particles_per_branch=512,

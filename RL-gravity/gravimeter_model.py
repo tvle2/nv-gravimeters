@@ -888,10 +888,11 @@ class BranchAwareGravityControlStrategy(Model):
     #     hi = tf.cast(tf.math.log(high), z.dtype)
     #     return tf.exp(lo + 0.5 * (z + 1.0) * (hi - lo))
     
-    
+
     def _map_log_interval(self, z: Tensor, low: float, high: float, power: float = 2.0) -> Tensor:
         u = 0.5 * (z + 1.0)
-        u = tf.clip_by_value(u, 0.0, 1.0)
+        # BUG FIX: Clip to 1e-7 instead of 0.0 to prevent zero-gradients in tf.pow!
+        u = tf.clip_by_value(u, 1e-7, 1.0 - 1e-7)
         u_warped = tf.pow(u, tf.cast(power, z.dtype))
 
         lo = tf.cast(tf.math.log(low), z.dtype)
@@ -973,8 +974,8 @@ class BranchAwareGravityControlStrategy(Model):
 
         # --- 5. Decoding Controls T_k and B'_k ---
         # Raw network controls mapped to physical logarithmic ranges. 
-        T_s = self._map_log_interval(zT, self.cfg.T_range_s[0], self.cfg.T_range_s[1], power=2.5)
-        Bp_kTm = self._map_log_interval(zB, self.cfg.Bp_range_kTm[0], self.cfg.Bp_range_kTm[1], power=3.0)
+        T_s = self._map_log_interval(zT, self.cfg.T_range_s[0], self.cfg.T_range_s[1], power=1.5)
+        Bp_kTm = self._map_log_interval(zB, self.cfg.Bp_range_kTm[0], self.cfg.Bp_range_kTm[1], power=2.0)
 
         mean_g_pm1 = branch_block[:, :, 1]
         mean_A_pm1 = branch_block[:, :, 2]
@@ -986,13 +987,37 @@ class BranchAwareGravityControlStrategy(Model):
         kg = self._k_g(T_s, Bp_kTm)   # (bs, 1)
         psi = kg * mu_g               # (bs, L)
 
+        ##################### Global phase lock representing arg C_k
+        # c_re = tf.reduce_sum(q * mu_A * tf.cos(psi), axis=1, keepdims=True)
+        # c_im = tf.reduce_sum(q * mu_A * tf.sin(psi), axis=1, keepdims=True)
+
+        # # Prevent the Phasor Singularity
+        # eps = tf.cast(1e-5, c_re.dtype)
+        # c_re_safe = c_re + eps
+        # c_im_safe = c_im + eps
+        
+        
+        # # pi/2 - arg C_k(T_k, B'_k)
+        # phase_lock_global = wrap_to_pi_tf(
+        #     tf.cast(pi / 2.0, c_re_safe.dtype) - tf.atan2(c_im_safe, c_re_safe)
+        # )
+        #############################################################
         # Global phase lock representing arg C_k
         c_re = tf.reduce_sum(q * mu_A * tf.cos(psi), axis=1, keepdims=True)
         c_im = tf.reduce_sum(q * mu_A * tf.sin(psi), axis=1, keepdims=True)
+
+        # Singularity Masking
+        # Calculate magnitude squared. If it vanishes, snap to a safe dummy vector (1, 0).
+        # This completely severs the gradient and prevents the 5-Billion explosion.
+        mag_sq = c_re**2 + c_im**2
+        safe_mask = mag_sq > tf.cast(1e-4, c_re.dtype)
+
+        c_re_safe = tf.where(safe_mask, c_re, tf.ones_like(c_re))
+        c_im_safe = tf.where(safe_mask, c_im, tf.zeros_like(c_im))
         
         # pi/2 - arg C_k(T_k, B'_k)
         phase_lock_global = wrap_to_pi_tf(
-            tf.cast(pi / 2.0, c_re.dtype) - tf.atan2(c_im, c_re)
+            tf.cast(pi / 2.0, c_re_safe.dtype) - tf.atan2(c_im_safe, c_re_safe)
         )
 
         # Learned residual detuning from the neural network head
