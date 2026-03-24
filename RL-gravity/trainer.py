@@ -29,15 +29,15 @@ from gravity_plotting import plot_branchbank_run
 # =============================================================================
 
 RUN_PROFILE = "full"   # "pilot" or "full"
-RUN_MODE = "all"        # "all" | "train-only" | "eval-only" | "plots-only"
+RUN_MODE = "eval-only"        # "all" | "train-only" | "eval-only" | "plots-only"
 OBJECTIVE_MODE = "gravity_only"   # "gravity_only" or "joint"
 EVAL_METRIC_MODE = "g_only"   # "g_only" or "same_as_training"
 TRAIN_CUMULATIVE_LOSS = True
 TRAIN_LOG_LOSS = False
 PF_BETA = 0.98
 PF_GAMMA = 0.98
-TRAIN_G_LOSS_SCALE = 1.0e5
-TRAIN_A_LOSS_SCALE = 1.0e3
+TRAIN_G_LOSS_SCALE = 1.0e4
+TRAIN_A_LOSS_SCALE = 1.0e2
 
 # =============================================================================
 # PROFILE DEFINITION
@@ -89,59 +89,14 @@ PILOT_PROFILE = RunProfile(
 )
 
 
-# FULL_PROFILE = RunProfile(
-#     name="full",
-#     out_dir="runs/gravimeter_branchbank_full_gA_direct3head_joint",
-
-#     batchsize=16,
-#     iterations=5000,
-#     interval_save=16,
-#     max_steps=768,
-#     max_resources=0.38,
-#     initial_lr=3e-4,
-#     seed=123,
-#     gradient_accumulation=8,
-
-#     num_branches=4,
-#     particles_per_branch=512,
-#     init_mode="stratified_g",
-#     hidden_sizes=(128, 192, 192, 128),
-
-#     control_history_iters=128,
-#     eval_iters=1024,
-#     plots_bins=40,
-# )
-
-# ################ Working profile for joint ################
-# FULL_PROFILE = RunProfile( 
-#     name="full", 
-#     out_dir="runs/gravimeter_branchbank_full_gA_direct3head_joint", 
-#     batchsize=32, 
-#     iterations=5000, 
-#     interval_save=16, 
-#     max_steps=512, 
-#     max_resources=0.38, 
-#     initial_lr=3e-4, 
-#     seed=123, 
-#     gradient_accumulation=8, 
-#     num_branches=4, 
-#     particles_per_branch=512, 
-#     init_mode="stratified_g", 
-#     hidden_sizes=(128, 192, 192, 128), 
-#     control_history_iters=128, 
-#     eval_iters=1024, 
-#     plots_bins=40, 
-# )
-#################################################
-
 FULL_PROFILE = RunProfile(
     name="full",
-    out_dir="runs/gravimeter_branchbank_full_gA_direct3head_gonly_v12",
+    out_dir="runs/gravimeter_branchbank_full_gA_direct3head_gonly_v9",
 
     batchsize=16,
     iterations=4000,
     interval_save=32,
-    max_steps=910,
+    max_steps=900,
     max_resources=0.5,
     initial_lr=3e-4,
     seed=123,
@@ -153,7 +108,7 @@ FULL_PROFILE = RunProfile(
     hidden_sizes=(128,128, 128),
 
     control_history_iters=128,
-    eval_iters=2048,
+    eval_iters=1024,
     plots_bins=80,
 )
 
@@ -268,8 +223,8 @@ def build_loaded_eval_sim(
         max_resources=profile.max_resources,
         initial_lr=profile.initial_lr,
         cov_weight_matrix=selected_eval_cov_weight_matrix(),
-        cumulative_loss=TRAIN_CUMULATIVE_LOSS,
-        log_loss=TRAIN_LOG_LOSS,
+        cumulative_loss=True,
+        log_loss=False,
         loss_logl_outcomes=True,
         baseline_correction=True,
         pf_beta=PF_BETA,
