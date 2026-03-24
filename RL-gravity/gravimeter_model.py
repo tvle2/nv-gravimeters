@@ -538,17 +538,17 @@ class GravityBranchBankParticleFilter(ParticleFilter):
             active[:, None],
         )  # (bs, L)
 
-        need_run = tf.reduce_any(branch_mask, axis=1)  # (bs,)
+        # need_run = tf.reduce_any(branch_mask, axis=1)  # (bs,)
 
-        num_active = tf.cast(tf.math.count_nonzero(active), tf.float64)
-        num_trigger = tf.cast(tf.math.count_nonzero(need_run), tf.float64)
+        # num_active = tf.cast(tf.math.count_nonzero(active), tf.float64)
+        # num_trigger = tf.cast(tf.math.count_nonzero(need_run), tf.float64)
 
-        resample_flag = tf.logical_and(
-            num_active > 0.0,
-            num_trigger >= self.res_frac * num_active,
-        )
+        # resample_flag = tf.logical_and(
+        #     num_active > 0.0,
+        #     num_trigger >= self.res_frac * num_active,
+        # )
 
-        # resample_flag = tf.reduce_any(branch_mask)
+        resample_flag = tf.reduce_any(branch_mask)
 
         def _do_resample():
             wloc_prop, pbank_prop = self._resample_all_branches(wloc, pbank, rangen)
