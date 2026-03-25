@@ -29,7 +29,7 @@ from gravity_plotting import plot_branchbank_run
 # =============================================================================
 
 RUN_PROFILE = "full"   # "pilot" or "full"
-RUN_MODE = "eval-only"        # "all" | "train-only" | "eval-only" | "plots-only"
+RUN_MODE = "all"        # "all" | "train-only" | "eval-only" | "plots-only"
 OBJECTIVE_MODE = "gravity_only"   # "gravity_only" or "joint"
 EVAL_METRIC_MODE = "g_only"   # "g_only" or "same_as_training"
 TRAIN_CUMULATIVE_LOSS = True
@@ -88,13 +88,12 @@ PILOT_PROFILE = RunProfile(
     plots_bins=40,
 )
 
-
 FULL_PROFILE = RunProfile(
     name="full",
-    out_dir="runs/gravimeter_branchbank_full_gA_direct3head_gonly_v9",
+    out_dir="runs/gravimeter_branchbank_full_gA_direct3head_gonly_checkpoint",
 
     batchsize=16,
-    iterations=4000,
+    iterations=5000,
     interval_save=32,
     max_steps=900,
     max_resources=0.5,
@@ -108,7 +107,7 @@ FULL_PROFILE = RunProfile(
     hidden_sizes=(128,128, 128),
 
     control_history_iters=128,
-    eval_iters=1024,
+    eval_iters=2048,
     plots_bins=80,
 )
 
@@ -223,8 +222,8 @@ def build_loaded_eval_sim(
         max_resources=profile.max_resources,
         initial_lr=profile.initial_lr,
         cov_weight_matrix=selected_eval_cov_weight_matrix(),
-        cumulative_loss=True,
-        log_loss=False,
+        cumulative_loss=TRAIN_CUMULATIVE_LOSS,
+        log_loss=TRAIN_LOG_LOSS,
         loss_logl_outcomes=True,
         baseline_correction=True,
         pf_beta=PF_BETA,

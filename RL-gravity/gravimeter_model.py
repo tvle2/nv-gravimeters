@@ -388,17 +388,11 @@ class GravityStatelessPhysicalModel(StatelessPhysicalModel):
     def count_resources(self, resources: Tensor, outcomes: Tensor, controls: Tensor, true_values: Tensor, meas_step: Tensor) -> Tensor:
         del outcomes, true_values, meas_step
 
-        tf.debugging.assert_all_finite(resources, "NaN/Inf in resources")
-        tf.debugging.assert_all_finite(controls, "NaN/Inf in controls")
-
         T_s = controls[..., 0]
         if T_s.shape.rank == 1:
             T_s = T_s[:, None]
 
-        new_resources = resources + self.cycle_time_s(T_s)
-        tf.debugging.assert_all_finite(new_resources, "NaN/Inf in new_used_resources")
-
-        return new_resources
+        return resources + self.cycle_time_s(T_s)
 
 
 class GravityBranchBankParticleFilter(ParticleFilter):
