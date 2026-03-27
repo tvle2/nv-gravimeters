@@ -164,7 +164,7 @@ class GravimeterConfig:
     kT_to_T: float = 1e3
 
     # parameter priors / admissible ranges
-    g_range: tuple[float, float] = (9.7806 , 9.825)
+    g_range: tuple[float, float] = (9.7806, 9.825)
     A_range: tuple[float, float] = (0.80, 1.0)
 
     # control ranges
@@ -172,10 +172,26 @@ class GravimeterConfig:
     Bp_range_kTm: tuple[float, float] = (2.0, 20.0)
     delta_max_rad: float = pi / 2.0
 
-    # hidden-noise model for true measurement simulation
-    mfg_rel_noise_bound: float = 0.025
-    mfg_noise_quad_points: int = 17
-    sigma_omega_rel: float = 0.001
+    # -----------------------------------------------------------------
+    # MFG is treated as a known deterministic control in the nominal model.
+    #
+    # Fixed calibration bias model:
+    #   Bp_applied = (1 + fixed_mfg_rel_bias) * Bp_commanded
+    #
+    # If apply_fixed_mfg_bias_in_model == True:
+    #   both simulator and likelihood use Bp_applied
+    #
+    # If apply_fixed_mfg_bias_in_model == False:
+    #   simulator uses Bp_applied, likelihood uses Bp_commanded
+    # -----------------------------------------------------------------
+    mfg_rel_noise_bound: float = 0.0
+    mfg_noise_quad_points: int = 1
+
+    fixed_mfg_rel_bias: float = 0.025
+    apply_fixed_mfg_bias_in_model: bool = True
+
+    # separate visibility / coherence effects
+    sigma_omega_rel: float = 0.01
     trap_visibility_mode: str = "small_noise_avg"   # none | small_noise_avg | exact_single_delta
     T2_spin_s: Optional[float] = None
     readout_flip_prob: float = 0.0
@@ -200,7 +216,6 @@ class BranchBankConfig:
 # -----------------------------------------------------------------------------
 # Gravity physical model (stateless probe)
 # -----------------------------------------------------------------------------
-
 class GravityStatelessPhysicalModel(StatelessPhysicalModel):
     """
     Unknown parameters:
@@ -209,8 +224,14 @@ class GravityStatelessPhysicalModel(StatelessPhysicalModel):
     Controls:
         x = (T_s, Bp_kTm, mw_phase_rad)
 
-    Likelihood:
-        p(y=1 | theta, x) = 1/2 [1 + V(T,B) * A * cos((1+eps) k_g(T,B) g + mw_phase)]
+    Deterministic-control likelihood:
+        p(y=1 | theta, x)
+          = 1/2 [1 + V(T,B') * A * cos(k_g(T,B') * g + mw_phase)]
+
+    Interpretation:
+        - B' (MFG) is a known control parameter.
+        - The Bayesian update conditions on the chosen control exactly.
+        - Optional trap / T2 / readout effects are modeled separately.
     """
 
     def __init__(self, batchsize: int, cfg: GravimeterConfig) -> None:
@@ -260,6 +281,36 @@ class GravityStatelessPhysicalModel(StatelessPhysicalModel):
         return (2.0 * ge / w) * Bp_T_per_m * (T_s ** 2) + (
             8.0 * tf.cast(pi, T_s.dtype) * ge / (w ** 3)
         ) * Bp_T_per_m
+    
+    def apply_fixed_mfg_bias(self, Bp_kTm: Tensor, *, use_bias: bool) -> Tensor:
+        """
+        Apply a fixed relative calibration bias to the commanded MFG.
+
+        Bp_applied = (1 + fixed_mfg_rel_bias) * Bp_commanded
+        """
+        if not use_bias:
+            return Bp_kTm
+
+        bias = tf.cast(1.0 + self.cfg.fixed_mfg_rel_bias, Bp_kTm.dtype)
+        return Bp_kTm * bias
+
+    def Bp_for_model(self, Bp_commanded_kTm: Tensor) -> Tensor:
+        """
+        MFG seen by the Bayesian likelihood / particle filter model.
+        """
+        return self.apply_fixed_mfg_bias(
+            Bp_commanded_kTm,
+            use_bias=self.cfg.apply_fixed_mfg_bias_in_model,
+        )
+
+    def Bp_for_measurement(self, Bp_commanded_kTm: Tensor) -> Tensor:
+        """
+        MFG used by the true shot simulator.
+        """
+        return self.apply_fixed_mfg_bias(
+            Bp_commanded_kTm,
+            use_bias=True,
+        )
 
     def cycle_time_s(self, T_s: Tensor) -> Tensor:
         cfg = self.cfg
@@ -268,14 +319,23 @@ class GravityStatelessPhysicalModel(StatelessPhysicalModel):
     def trap_visibility_avg_small_noise(self, Bp_kTm: Tensor) -> Tensor:
         cfg = self.cfg
         eta = self.eta(Bp_kTm)
-        correction = tf.cast(1944.0 * (pi ** 4) * (cfg.sigma_omega_rel ** 4), eta.dtype) * (eta ** 2)
+        correction = tf.cast(
+            1944.0 * (pi ** 4) * (cfg.sigma_omega_rel ** 4),
+            eta.dtype,
+        ) * (eta ** 2)
         return tf.clip_by_value(1.0 - correction, 0.0, 1.0)
 
-    def trap_visibility_exact_from_delta_omega(self, Bp_kTm: Tensor, delta_omega_rad_s: Tensor) -> Tensor:
+    def trap_visibility_exact_from_delta_omega(
+        self,
+        Bp_kTm: Tensor,
+        delta_omega_rad_s: Tensor,
+    ) -> Tensor:
         cfg = self.cfg
         eta = self.eta(Bp_kTm)
         tau = tf.cast(cfg.tau_s, eta.dtype)
-        x = tf.cast(cfg.omega_rad_s, eta.dtype) * (-tau * delta_omega_rad_s / tf.cast(cfg.omega_rad_s, eta.dtype))
+        x = tf.cast(cfg.omega_rad_s, eta.dtype) * (
+            -tau * delta_omega_rad_s / tf.cast(cfg.omega_rad_s, eta.dtype)
+        )
         amp = 16.0 * eta * tf.cos(x / 4.0) * (tf.sin(3.0 * x / 4.0) ** 2)
         return tf.exp(-0.5 * amp ** 2)
 
@@ -290,7 +350,12 @@ class GravityStatelessPhysicalModel(StatelessPhysicalModel):
             vis = vis * tf.exp(-self.cycle_time_s(T_s) / tf.cast(cfg.T2_spin_s, vis.dtype))
         return tf.clip_by_value(vis, 0.0, 1.0)
 
-    def sample_true_visibility_factor(self, T_s: Tensor, Bp_kTm: Tensor, rangen: tf.random.Generator) -> Tensor:
+    def sample_true_visibility_factor(
+        self,
+        T_s: Tensor,
+        Bp_kTm: Tensor,
+        rangen: tf.random.Generator,
+    ) -> Tensor:
         cfg = self.cfg
         if cfg.trap_visibility_mode == "none":
             vis = tf.ones_like(T_s)
@@ -310,67 +375,63 @@ class GravityStatelessPhysicalModel(StatelessPhysicalModel):
         return tf.clip_by_value(vis, 0.0, 1.0)
 
     def mfg_quadrature(self) -> Tensor:
-        cfg = self.cfg
-        if cfg.mfg_rel_noise_bound <= 0.0:
-            return tf.constant([0.0], dtype=cfg.prec)
-        return tf.linspace(
-            tf.cast(-cfg.mfg_rel_noise_bound, cfg.prec),
-            tf.cast(+cfg.mfg_rel_noise_bound, cfg.prec),
-            int(max(3, cfg.mfg_noise_quad_points)),
-        )
+        # Kept only for compatibility with older code paths.
+        # In the deterministic-control model there is no hidden MFG quadrature.
+        return tf.constant([0.0], dtype=self.cfg.prec)
 
-    def model(self, outcomes: Tensor, controls: Tensor, parameters: Tensor, meas_step: Tensor, num_systems: int = 1) -> Tensor:
+    def model(
+        self,
+        outcomes: Tensor,
+        controls: Tensor,
+        parameters: Tensor,
+        meas_step: Tensor,
+        num_systems: int = 1,
+    ) -> Tensor:
         del meas_step, num_systems
 
         T_s = controls[:, :, 0]
-        Bp_kTm = controls[:, :, 1]
+        Bp_commanded_kTm = controls[:, :, 1]
         mw_phase = controls[:, :, 2]
+
+        # What the inference model believes the applied MFG is.
+        Bp_kTm = self.Bp_for_model(Bp_commanded_kTm)
 
         g = parameters[:, :, 0]
         A = parameters[:, :, 1]
 
         vis_known = self.known_visibility_factor(T_s, Bp_kTm)
         total_vis = tf.clip_by_value(A * vis_known, 0.0, 1.0)
-        kg = self.k_g(T_s, Bp_kTm)
 
-        eps_grid = tf.cast(self.mfg_quadrature(), T_s.dtype)
-        theta = (
-            tf.expand_dims(kg * g, axis=2) * (1.0 + eps_grid[None, None, :])
-            + tf.expand_dims(mw_phase, axis=2)
-        )
-
-        p_plus = 0.5 * (1.0 + tf.expand_dims(total_vis, axis=2) * tf.cos(theta))
-        p_plus = safe_clip_prob(p_plus)
-        p_plus = tf.reduce_mean(p_plus, axis=2)
+        theta = self.k_g(T_s, Bp_kTm) * g + mw_phase
+        p_plus = safe_clip_prob(0.5 * (1.0 + total_vis * tf.cos(theta)))
 
         y = outcomes[:, :, 0]
         prob = tf.where(y > 0.5, p_plus, 1.0 - p_plus)
         return safe_clip_prob(prob)
 
-    def perform_measurement(self, controls: Tensor, parameters: Tensor, meas_step: Tensor, rangen: tf.random.Generator) -> tuple[Tensor, Tensor]:
+    def perform_measurement(
+        self,
+        controls: Tensor,
+        parameters: Tensor,
+        meas_step: Tensor,
+        rangen: tf.random.Generator,
+    ) -> tuple[Tensor, Tensor]:
         del meas_step
 
         T_s = controls[:, 0, 0]
-        Bp_kTm = controls[:, 0, 1]
+        Bp_commanded_kTm = controls[:, 0, 1]
         mw_phase = controls[:, 0, 2]
+
+        # What the hardware actually applies.
+        Bp_kTm = self.Bp_for_measurement(Bp_commanded_kTm)
 
         g = parameters[:, 0, 0]
         A = parameters[:, 0, 1]
 
-        if self.cfg.mfg_rel_noise_bound > 0.0:
-            eps_true = rangen.uniform(
-                shape=tf.shape(T_s),
-                minval=tf.cast(-self.cfg.mfg_rel_noise_bound, T_s.dtype),
-                maxval=tf.cast(+self.cfg.mfg_rel_noise_bound, T_s.dtype),
-                dtype=T_s.dtype,
-            )
-        else:
-            eps_true = tf.zeros_like(T_s)
-
         vis_true = self.sample_true_visibility_factor(T_s, Bp_kTm, rangen)
         total_vis = tf.clip_by_value(A * vis_true, 0.0, 1.0)
 
-        theta = (1.0 + eps_true) * self.k_g(T_s, Bp_kTm) * g + mw_phase
+        theta = self.k_g(T_s, Bp_kTm) * g + mw_phase
         p_plus = safe_clip_prob(0.5 * (1.0 + total_vis * tf.cos(theta)))
 
         if self.cfg.readout_flip_prob > 0.0:
@@ -378,14 +439,29 @@ class GravityStatelessPhysicalModel(StatelessPhysicalModel):
             p_plus = (1.0 - flip) * p_plus + flip * (1.0 - p_plus)
             p_plus = safe_clip_prob(p_plus)
 
-        u = rangen.uniform(shape=tf.shape(p_plus), minval=0.0, maxval=1.0, dtype=p_plus.dtype)
+        u = rangen.uniform(
+            shape=tf.shape(p_plus),
+            minval=0.0,
+            maxval=1.0,
+            dtype=p_plus.dtype,
+        )
         y = tf.cast(u < p_plus, p_plus.dtype)
 
         outcomes = tf.expand_dims(tf.expand_dims(y, axis=1), axis=2)
-        log_prob = tf.expand_dims(tf.math.log(tf.where(y > 0.5, p_plus, 1.0 - p_plus)), axis=1)
+        log_prob = tf.expand_dims(
+            tf.math.log(tf.where(y > 0.5, p_plus, 1.0 - p_plus)),
+            axis=1,
+        )
         return outcomes, log_prob
 
-    def count_resources(self, resources: Tensor, outcomes: Tensor, controls: Tensor, true_values: Tensor, meas_step: Tensor) -> Tensor:
+    def count_resources(
+        self,
+        resources: Tensor,
+        outcomes: Tensor,
+        controls: Tensor,
+        true_values: Tensor,
+        meas_step: Tensor,
+    ) -> Tensor:
         del outcomes, true_values, meas_step
 
         T_s = controls[..., 0]
@@ -393,7 +469,7 @@ class GravityStatelessPhysicalModel(StatelessPhysicalModel):
             T_s = T_s[:, None]
 
         return resources + self.cycle_time_s(T_s)
-
+    
 
 class GravityBranchBankParticleFilter(ParticleFilter):
     def __init__(
@@ -532,15 +608,6 @@ class GravityBranchBankParticleFilter(ParticleFilter):
             active[:, None],
         )  # (bs, L)
 
-        # need_run = tf.reduce_any(branch_mask, axis=1)  # (bs,)
-
-        # num_active = tf.cast(tf.math.count_nonzero(active), tf.float64)
-        # num_trigger = tf.cast(tf.math.count_nonzero(need_run), tf.float64)
-
-        # resample_flag = tf.logical_and(
-        #     num_active > 0.0,
-        #     num_trigger >= self.res_frac * num_active,
-        # )
 
         resample_flag = tf.reduce_any(branch_mask)
 
@@ -1302,7 +1369,7 @@ def train_branchbank_gravity_modelaware(
         interval_save=interval_save,
         network=net,
         gradient_accumulation=gradient_accumulation,
-        xla_compile=True,
+        xla_compile=False,
         rangen=rangen,
     )
 
@@ -1319,7 +1386,7 @@ def export_branchbank_control_history(sim, out_dir: str | Path, iterations: int 
         simulation=sim,
         data_dir=str(out_dir),
         iterations=iterations,
-        xla_compile=True,
+        xla_compile=False,
         rangen=rangen,
     )
     return _canonicalize_control_export(sim=sim, out_dir=out_dir)
@@ -1344,7 +1411,7 @@ def evaluate_branchbank_precision(
         simulation=sim,
         iterations=iterations,
         data_dir=str(out_dir),
-        xla_compile=True,
+        xla_compile=False,
         precision_fit=None,
         delta_resources=delta_resources,
         y_label=metric_label,

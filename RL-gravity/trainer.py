@@ -5,6 +5,7 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
 from dataclasses import dataclass
 from pathlib import Path
+from math import pi
 
 from gravimeter_model import (
     GravimeterConfig,
@@ -28,11 +29,11 @@ from gravity_plotting import plot_branchbank_run
 # USER SWITCHES
 # =============================================================================
 
-RUN_PROFILE = "full"   # "pilot" or "full"
+RUN_PROFILE = "pilot"   # "pilot" or "full"
 RUN_MODE = "all"        # "all" | "train-only" | "eval-only" | "plots-only"
 OBJECTIVE_MODE = "gravity_only"   # "gravity_only" or "joint"
 EVAL_METRIC_MODE = "g_only"   # "g_only" or "same_as_training"
-TRAIN_CUMULATIVE_LOSS = True
+TRAIN_CUMULATIVE_LOSS = False
 TRAIN_LOG_LOSS = False
 PF_BETA = 0.98
 PF_GAMMA = 0.98
@@ -69,23 +70,25 @@ class RunProfile:
 
 PILOT_PROFILE = RunProfile(
     name="pilot",
-    out_dir="runs/gravimeter_branchbank_pilot_gA_joint",
+    out_dir="runs/gravimeter_branchbank_paper_no_noise",
 
-    batchsize=32,
-    iterations=4000,
-    interval_save=32,
-    max_steps=170,
-    max_resources=0.1,
+    batchsize=8,
+    iterations=1000,
+    interval_save=16,
+    max_steps=256,
+    max_resources=0.10,
     initial_lr=3e-4,
     seed=123,
-    gradient_accumulation=8,
+    gradient_accumulation=2,
+
     num_branches=4,
-    particles_per_branch=256, 
-    init_mode="stratified_g", 
-    hidden_sizes=(128, 128, 128, 128),
-    control_history_iters=128,
-    eval_iters=1024,
-    plots_bins=40,
+    particles_per_branch=64,
+    init_mode="stratified_g",
+    hidden_sizes=(128, 128, 128),
+
+    control_history_iters=32,
+    eval_iters=256,
+    plots_bins=60,
 )
 
 FULL_PROFILE = RunProfile(
@@ -94,7 +97,7 @@ FULL_PROFILE = RunProfile(
 
     batchsize=16,
     iterations=5000,
-    interval_save=32,
+    interval_save=1,
     max_steps=900,
     max_resources=0.5,
     initial_lr=3e-4,
@@ -138,8 +141,34 @@ def selected_train_cov_weight_matrix():
     raise ValueError(f"Unknown OBJECTIVE_MODE={OBJECTIVE_MODE!r}")
 
 def make_cfg() -> GravimeterConfig:
-    # Edit here if you want to override physical defaults.
-    return default_cfg()
+    return GravimeterConfig(
+        g_range=(9.7806, 9.825),
+        A_range=(0.80, 1.0),
+
+        T_range_s=(5.0e-4, 1.0e-3),
+        Bp_range_kTm=(2.0, 20.0),
+        delta_max_rad=pi / 2.0,
+
+        # deterministic MFG baseline
+        mfg_rel_noise_bound=0.0,
+        mfg_noise_quad_points=1,
+
+        # fixed calibration bias:
+        # Bp_applied = (1 + fixed_mfg_rel_bias) * Bp_commanded
+        fixed_mfg_rel_bias=0.0, #0.025
+        apply_fixed_mfg_bias_in_model=True,
+
+        # nominal baseline: no visibility loss channels
+        sigma_omega_rel=0.0, #0.01
+        trap_visibility_mode="none", #small_noise_avg
+        T2_spin_s=None,
+
+        # ideal readout for the baseline
+        readout_flip_prob=0.0,
+
+        dead_time_s=0.0,
+        prec="float32",
+    )
 
 
 def make_bank_cfg(profile: RunProfile) -> BranchBankConfig:

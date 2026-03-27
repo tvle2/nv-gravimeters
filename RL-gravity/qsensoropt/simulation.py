@@ -7,6 +7,7 @@ from tensorflow import zeros, ones, reduce_mean, \
     stop_gradient, expand_dims, constant, while_loop, \
     cast, where, concat, reshape, broadcast_to, cond, \
     tensor_scatter_nd_add, sort, Tensor
+import tensorflow as tf
 from tensorflow.math import less, count_nonzero, \
     logical_not, reciprocal_no_nan, add, log, \
     reduce_sum, less_equal, logical_or, \
@@ -331,11 +332,23 @@ class Simulation:
         else:
             controls = self.control_strategy(cond_input)
 
+        # tf.debugging.assert_all_finite(input_strategy, "input_strategy has NaN/Inf")
+        # tf.debugging.assert_all_finite(controls, "controls has NaN/Inf")
+
         # Update the used resources
         new_used_resources = self.phys_model.wrapper_count_resources(
             used_resources, outcomes, controls, true_values,
             true_state, meas_step,
         )
+        # tf.debugging.assert_all_finite(new_used_resources, "new_used_resources has NaN/Inf")
+
+        # tf.print(
+        #     "index=", index,
+        #     " alive=", tf.math.count_nonzero(continue_flag),
+        #     " ctrl0=", controls[0],
+        #     " res0=", new_used_resources[0],
+        #     summarize=-1
+        # )
 
         # Which estimations in th batch have not
         # yet run out of resources?
