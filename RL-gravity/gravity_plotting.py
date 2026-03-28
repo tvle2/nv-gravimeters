@@ -1,30 +1,31 @@
-# gravity_plotting.py
 from __future__ import annotations
 
-"""
-Plotting utilities for the branch-bank gravimeter runs.
-
-Expected canonical files produced by gravimeter_model.py:
-    run_dir/training_history.csv
-    run_dir/controls/branchbank_controls.csv
-    run_dir/eval/branchbank_eval.csv
-"""
-
+import json
+from math import isfinite
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
 
-def _prefer_file(preferred: Path, fallback_patterns: Iterable[str]) -> Optional[Path]:
-    if preferred.exists():
-        return preferred
-    for pattern in fallback_patterns:
-        matches = sorted(preferred.parent.glob(pattern))
-        if matches:
-            return matches[-1]
+# =============================================================================
+# Small helpers
+# =============================================================================
+
+def _latest_matching_file(directory: Path, pattern: str) -> Optional[Path]:
+    matches = list(directory.glob(pattern))
+    if not matches:
+        return None
+    matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return matches[0]
+
+
+def _first_existing(paths: list[Path]) -> Optional[Path]:
+    for p in paths:
+        if p.exists():
+            return p
     return None
 
 
@@ -33,366 +34,533 @@ def _ensure_dir(path: Path) -> Path:
     return path
 
 
-def _resource_binned_mean(df: pd.DataFrame, x: str, y: str, bins: int = 40) -> pd.DataFrame:
-    if x not in df.columns or y not in df.columns or len(df) == 0:
-        return pd.DataFrame(columns=[x, y])
-
-    xvals = df[x].to_numpy(dtype=float)
-    yvals = df[y].to_numpy(dtype=float)
-
-    finite = np.isfinite(xvals) & np.isfinite(yvals)
-    xvals = xvals[finite]
-    yvals = yvals[finite]
-    if len(xvals) == 0:
-        return pd.DataFrame(columns=[x, y])
-
-    if np.allclose(np.min(xvals), np.max(xvals)):
-        return pd.DataFrame({x: [np.mean(xvals)], y: [np.mean(yvals)]})
-
-    edges = np.linspace(np.min(xvals), np.max(xvals), bins + 1)
-    ids = np.digitize(xvals, edges) - 1
-    ids = np.clip(ids, 0, bins - 1)
-
-    out = pd.DataFrame({x: xvals, y: yvals, "_bin": ids})
-    out = out.groupby("_bin")[[x, y]].mean().reset_index(drop=True)
-    return out.sort_values(x).reset_index(drop=True)
+def _safe_read_csv(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        raise FileNotFoundError(f"CSV not found: {path}")
+    df = pd.read_csv(path)
+    if df.empty:
+        return df
+    return df
 
 
-def _branch_columns(df: pd.DataFrame, suffix: str) -> list[str]:
-    out = []
-    idx = 1
-    while True:
-        col = f"Branch{idx}_{suffix}"
-        if col in df.columns:
-            out.append(col)
-            idx += 1
-        else:
-            break
+def _savefig(fig: plt.Figure, path: Path) -> None:
+    fig.tight_layout()
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _load_run_config(out_dir: Path) -> dict:
+    cfg_path = out_dir / "run_config.json"
+    if not cfg_path.exists():
+        return {}
+    with cfg_path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _infer_interval_save(run_cfg: dict) -> int:
+    try:
+        return max(1, int(run_cfg.get("interval_save", 1)))
+    except Exception:
+        return 1
+
+
+def _infer_train_baseline(run_cfg: dict) -> Optional[float]:
+    """
+    For gravity-only training:
+        baseline = Var_uniform(g_range) * train_g_loss_scale
+    """
+    try:
+        if str(run_cfg.get("objective_mode", "")).strip().lower() != "gravity_only":
+            return None
+        g_lo, g_hi = run_cfg["gravimeter_config"]["g_range"]
+        scale = float(run_cfg["train_g_loss_scale"])
+        var_uniform = (float(g_hi) - float(g_lo)) ** 2 / 12.0
+        baseline = var_uniform * scale
+        return baseline if isfinite(baseline) else None
+    except Exception:
+        return None
+
+
+def _infer_eval_baseline(run_cfg: dict) -> Optional[float]:
+    """
+    Prior variance baseline for MSE_g:
+        Var_uniform(g_range)
+    """
+    try:
+        g_lo, g_hi = run_cfg["gravimeter_config"]["g_range"]
+        var_uniform = (float(g_hi) - float(g_lo)) ** 2 / 12.0
+        return var_uniform if isfinite(var_uniform) else None
+    except Exception:
+        return None
+
+
+def _ema(values: np.ndarray, span: int) -> np.ndarray:
+    return pd.Series(values).ewm(span=max(2, span), adjust=False).mean().to_numpy()
+
+
+def _rolling_median(values: np.ndarray, window: int) -> np.ndarray:
+    return (
+        pd.Series(values)
+        .rolling(window=max(1, window), center=True, min_periods=1)
+        .median()
+        .to_numpy()
+    )
+
+
+def _cumulative_min(values: np.ndarray) -> np.ndarray:
+    out = np.empty_like(values, dtype=float)
+    cur = np.inf
+    for i, v in enumerate(values):
+        cur = min(cur, float(v))
+        out[i] = cur
     return out
 
 
-def _save_line(df: pd.DataFrame, x: str, y: str, out_path: Path, *, logy: bool = True, title: str = "") -> None:
-    if x not in df.columns or y not in df.columns or len(df) == 0:
-        return
-
-    plot_df = df[[x, y]].replace([np.inf, -np.inf], np.nan).dropna()
-    if len(plot_df) == 0:
-        return
-
-    fig, ax = plt.subplots(figsize=(5.5, 3.8), dpi=180)
-    ax.plot(plot_df[x], plot_df[y], linewidth=1.6)
-    ax.set_xlabel(x)
-    ax.set_ylabel(y)
-    if title:
-        ax.set_title(title)
-    ax.grid(True, alpha=0.3)
-    if logy:
+def _maybe_log_y(ax: plt.Axes, values: np.ndarray) -> None:
+    if len(values) and np.all(np.asarray(values) > 0.0):
         ax.set_yscale("log")
-    fig.tight_layout()
-    fig.savefig(out_path)
-    plt.close(fig)
 
 
-def _save_scatter(df: pd.DataFrame, x: str, y: str, c: str, out_path: Path, *, title: str = "") -> None:
-    if not {x, y, c}.issubset(df.columns) or len(df) == 0:
+def _numeric_columns(df: pd.DataFrame) -> list[str]:
+    return [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+
+
+# =============================================================================
+# File discovery
+# =============================================================================
+
+def _find_history_csv(out_dir: Path) -> Optional[Path]:
+    # Canonical local copy if you save one manually
+    direct = out_dir / "training_history.csv"
+    if direct.exists():
+        return direct
+
+    # qsensoropt / trainer-style history in run root
+    hist = _latest_matching_file(out_dir, "*_history.csv")
+    if hist is not None:
+        return hist
+
+    # fallback recursive
+    candidates = list(out_dir.rglob("*_history.csv"))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
+def _find_eval_csv(out_dir: Path) -> Optional[Path]:
+    direct = out_dir / "eval" / "branchbank_eval.csv"
+    if direct.exists():
+        return direct
+
+    alt = _latest_matching_file(out_dir / "eval", "*_eval.csv") if (out_dir / "eval").exists() else None
+    if alt is not None:
+        return alt
+
+    # fallback recursive
+    candidates = list(out_dir.rglob("*_eval.csv"))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
+def _find_controls_csv(out_dir: Path) -> Optional[Path]:
+    direct = out_dir / "controls" / "branchbank_controls.csv"
+    if direct.exists():
+        return direct
+
+    alt = _latest_matching_file(out_dir / "controls", "*_ext.csv") if (out_dir / "controls").exists() else None
+    if alt is not None:
+        return alt
+
+    # fallback recursive
+    candidates = list(out_dir.rglob("*_ext.csv"))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
+# =============================================================================
+# Training-loss plotting
+# =============================================================================
+
+def _prepare_training_history_df(df: pd.DataFrame, interval_save: int) -> pd.DataFrame:
+    out = df.copy()
+
+    if "Loss" not in out.columns:
+        raise ValueError("Training history CSV must contain a 'Loss' column.")
+
+    if "Checkpoint" not in out.columns:
+        out["Checkpoint"] = np.arange(1, len(out) + 1, dtype=np.int64)
+
+    out["UpdateStep"] = out["Checkpoint"] * int(interval_save)
+
+    span = max(3, min(15, len(out) // 6 if len(out) >= 6 else 3))
+    roll = max(3, min(11, span))
+
+    out["Loss_EMA"] = _ema(out["Loss"].to_numpy(dtype=float), span=span)
+    out["Loss_RollMedian"] = _rolling_median(out["Loss"].to_numpy(dtype=float), window=roll)
+    out["Loss_BestSoFar"] = _cumulative_min(out["Loss"].to_numpy(dtype=float))
+    return out
+
+
+def plot_training_history(out_dir: Path, plots_dir: Path) -> Optional[Path]:
+    history_csv = _find_history_csv(out_dir)
+    if history_csv is None:
+        return None
+
+    run_cfg = _load_run_config(out_dir)
+    interval_save = _infer_interval_save(run_cfg)
+
+    df = _safe_read_csv(history_csv)
+    if df.empty:
+        return None
+
+    dfp = _prepare_training_history_df(df, interval_save)
+    dfp.to_csv(plots_dir / "training_loss_summary.csv", index=False)
+
+    # Linear plot: EMA only
+    fig, ax = plt.subplots(figsize=(7.2, 4.8), dpi=180)
+    ax.plot(
+        dfp["UpdateStep"],
+        dfp["Loss_EMA"],
+        linewidth=2.6,
+    )
+    ax.set_xlabel("Training iteration")
+    ax.set_ylabel("Loss")
+    ax.grid(True, which="both", alpha=0.3)
+    _savefig(fig, plots_dir / "training_loss.png")
+
+    # Log-y plot: EMA only
+    fig, ax = plt.subplots(figsize=(7.2, 4.8), dpi=180)
+    ax.plot(
+        dfp["UpdateStep"],
+        dfp["Loss_EMA"],
+        linewidth=2.6,
+    )
+    _maybe_log_y(ax, dfp["Loss_EMA"].to_numpy(dtype=float))
+    ax.set_xlabel("Training iteration")
+    ax.set_ylabel("Loss")
+    ax.grid(True, which="both", alpha=0.3)
+    _savefig(fig, plots_dir / "training_loss_log.png")
+
+    return history_csv
+
+
+# =============================================================================
+# Eval plotting
+# =============================================================================
+
+def plot_eval_curve(out_dir: Path, plots_dir: Path) -> Optional[Path]:
+    eval_csv = _find_eval_csv(out_dir)
+    if eval_csv is None:
+        return None
+
+    run_cfg = _load_run_config(out_dir)
+    eval_baseline = _infer_eval_baseline(run_cfg)
+
+    df = _safe_read_csv(eval_csv)
+    if df.empty or "Resources" not in df.columns:
+        return None
+
+    y_col = "MSE_g" if "MSE_g" in df.columns else [c for c in df.columns if c != "Resources"][0]
+    vals = df[y_col].to_numpy(dtype=float)
+
+    fig, ax = plt.subplots(figsize=(7.2, 4.8), dpi=180)
+    ax.plot(df["Resources"], vals, linewidth=2.0, marker="o", markersize=2.5)
+    if eval_baseline is not None:
+        ax.axhline(eval_baseline, linewidth=1.2, linestyle="-.", label=f"Prior baseline ≈ {eval_baseline:.4g}")
+        ax.legend(fontsize=8)
+    _maybe_log_y(ax, vals)
+    ax.set_title(f"{y_col} vs resources")
+    ax.set_xlabel("Resources")
+    ax.set_ylabel(y_col)
+    ax.grid(True, which="both", alpha=0.3)
+    _savefig(fig, plots_dir / f"eval_{y_col}_vs_resources.png")
+
+    # Improvement factor if baseline exists
+    if eval_baseline is not None and len(vals) > 0 and vals[-1] > 0.0:
+        improvement = eval_baseline / vals[-1]
+        fig, ax = plt.subplots(figsize=(7.2, 4.8), dpi=180)
+        ax.plot(df["Resources"], eval_baseline / vals, linewidth=2.0)
+        _maybe_log_y(ax, (eval_baseline / vals))
+        ax.set_title(f"Improvement factor vs resources (final ≈ {improvement:.3g}×)")
+        ax.set_xlabel("Resources")
+        ax.set_ylabel("Baseline / MSE")
+        ax.grid(True, which="both", alpha=0.3)
+        _savefig(fig, plots_dir / "eval_improvement_factor_vs_resources.png")
+
+    return eval_csv
+
+
+# =============================================================================
+# Control-history plotting
+# =============================================================================
+
+def _sort_controls_df(df: pd.DataFrame) -> pd.DataFrame:
+    if "ResOverMaxRes" in df.columns:
+        return df.sort_values(["ResOverMaxRes", "StepOverMaxStep"], kind="mergesort").reset_index(drop=True)
+    if "StepOverMaxStep" in df.columns:
+        return df.sort_values(["StepOverMaxStep"], kind="mergesort").reset_index(drop=True)
+    return df.reset_index(drop=True)
+
+
+def plot_controls_vs_progress(df: pd.DataFrame, plots_dir: Path) -> None:
+    progress_col = "ResOverMaxRes" if "ResOverMaxRes" in df.columns else (
+        "StepOverMaxStep" if "StepOverMaxStep" in df.columns else None
+    )
+    if progress_col is None:
         return
 
-    plot_df = df[[x, y, c]].replace([np.inf, -np.inf], np.nan).dropna()
-    if len(plot_df) == 0:
+    for col in ["T_s", "Bp_kTm", "mw_phase_rad"]:
+        if col not in df.columns:
+            continue
+        fig, ax = plt.subplots(figsize=(7.2, 4.8), dpi=180)
+        ax.scatter(df[progress_col], df[col], s=5, alpha=0.25)
+        ax.set_title(f"{col} vs {progress_col}")
+        ax.set_xlabel(progress_col)
+        ax.set_ylabel(col)
+        ax.grid(True, which="both", alpha=0.3)
+        _savefig(fig, plots_dir / f"controls_{col}_vs_{progress_col}.png")
+
+    # Combined line plot using binned medians
+    bins = np.linspace(float(df[progress_col].min()), float(df[progress_col].max()), 41)
+    if len(np.unique(bins)) > 2:
+        out = df[[progress_col] + [c for c in ["T_s", "Bp_kTm", "mw_phase_rad"] if c in df.columns]].copy()
+        out["bin"] = pd.cut(out[progress_col], bins=bins, include_lowest=True, duplicates="drop")
+        med = out.groupby("bin", observed=False).median(numeric_only=True)
+        ctr = np.array([interval.mid for interval in med.index], dtype=float)
+
+        fig, ax = plt.subplots(figsize=(7.2, 4.8), dpi=180)
+        for col in ["T_s", "Bp_kTm", "mw_phase_rad"]:
+            if col in med.columns:
+                ax.plot(ctr, med[col].to_numpy(dtype=float), linewidth=2.0, label=col)
+        ax.set_title(f"Median controls vs {progress_col}")
+        ax.set_xlabel(progress_col)
+        ax.set_ylabel("Control value")
+        ax.grid(True, which="both", alpha=0.3)
+        ax.legend(fontsize=8)
+        _savefig(fig, plots_dir / f"controls_median_vs_{progress_col}.png")
+
+
+def plot_control_histograms(df: pd.DataFrame, plots_dir: Path, bins: int = 60) -> None:
+    cols = [c for c in ["T_s", "Bp_kTm", "mw_phase_rad"] if c in df.columns]
+    if not cols:
         return
 
-    fig, ax = plt.subplots(figsize=(5.5, 3.8), dpi=180)
-    sc = ax.scatter(plot_df[x], plot_df[y], c=plot_df[c], s=10, alpha=0.7)
-    ax.set_xlabel(x)
-    ax.set_ylabel(y)
-    if title:
-        ax.set_title(title)
-    ax.grid(True, alpha=0.3)
-    cbar = fig.colorbar(sc, ax=ax)
-    cbar.set_label(c)
-    fig.tight_layout()
-    fig.savefig(out_path)
-    plt.close(fig)
+    fig, axes = plt.subplots(len(cols), 1, figsize=(7.2, 2.6 * len(cols)), dpi=180)
+    if len(cols) == 1:
+        axes = [axes]
+
+    for ax, col in zip(axes, cols):
+        ax.hist(df[col].to_numpy(dtype=float), bins=bins, alpha=0.85)
+        ax.set_title(f"{col} histogram")
+        ax.set_xlabel(col)
+        ax.set_ylabel("Count")
+        ax.grid(True, which="both", alpha=0.25)
+
+    _savefig(fig, plots_dir / "controls_histograms.png")
 
 
-def _save_multiline(
-    curves: list[pd.DataFrame],
-    labels: list[str],
-    x: str,
-    y: str,
-    out_path: Path,
-    *,
-    title: str = "",
-) -> None:
-    if not curves:
+def plot_posterior_metrics(df: pd.DataFrame, plots_dir: Path) -> None:
+    progress_col = "ResOverMaxRes" if "ResOverMaxRes" in df.columns else (
+        "StepOverMaxStep" if "StepOverMaxStep" in df.columns else None
+    )
+    if progress_col is None:
         return
 
-    fig, ax = plt.subplots(figsize=(6.2, 4.0), dpi=180)
-    plotted_any = False
+    metric_groups = [
+        ["Std_g", "Std_A"],
+        ["BranchEntropy", "BranchDominance", "QGap12"],
+        ["Top1Mass", "Top2Mass"],
+        ["Mean_g", "Mean_A"],
+    ]
 
-    for df, label in zip(curves, labels):
-        if x in df.columns and y in df.columns and len(df) > 0:
-            plot_df = df[[x, y]].replace([np.inf, -np.inf], np.nan).dropna()
-            if len(plot_df) > 0:
-                ax.plot(plot_df[x], plot_df[y], linewidth=1.4, label=label)
-                plotted_any = True
+    for group in metric_groups:
+        cols = [c for c in group if c in df.columns]
+        if not cols:
+            continue
 
-    if not plotted_any:
-        plt.close(fig)
+        fig, ax = plt.subplots(figsize=(7.2, 4.8), dpi=180)
+        for col in cols:
+            ax.scatter(df[progress_col], df[col], s=4, alpha=0.18, label=col)
+
+            # Add binned median trend
+            bins = np.linspace(float(df[progress_col].min()), float(df[progress_col].max()), 41)
+            tmp = df[[progress_col, col]].dropna().copy()
+            tmp["bin"] = pd.cut(tmp[progress_col], bins=bins, include_lowest=True, duplicates="drop")
+            med = tmp.groupby("bin", observed=False)[col].median()
+            ctr = np.array([interval.mid for interval in med.index], dtype=float)
+            ax.plot(ctr, med.to_numpy(dtype=float), linewidth=2.0)
+
+        ax.set_title(f"Posterior metrics vs {progress_col}")
+        ax.set_xlabel(progress_col)
+        ax.set_ylabel("Value")
+        ax.grid(True, which="both", alpha=0.3)
+        ax.legend(fontsize=8)
+        _savefig(fig, plots_dir / f"posterior_{'_'.join(cols)}_vs_{progress_col}.png")
+
+
+def plot_branch_masses(df: pd.DataFrame, plots_dir: Path) -> None:
+    progress_col = "ResOverMaxRes" if "ResOverMaxRes" in df.columns else (
+        "StepOverMaxStep" if "StepOverMaxStep" in df.columns else None
+    )
+    mass_cols = [c for c in df.columns if c.startswith("Branch") and c.endswith("_Mass")]
+    if progress_col is None or not mass_cols:
         return
 
-    ax.set_xlabel(x)
-    ax.set_ylabel(y)
-    if title:
-        ax.set_title(title)
-    ax.grid(True, alpha=0.3)
-    ax.legend(fontsize=7, loc="best")
-    fig.tight_layout()
-    fig.savefig(out_path)
-    plt.close(fig)
+    fig, ax = plt.subplots(figsize=(7.2, 4.8), dpi=180)
+    for col in mass_cols:
+        ax.scatter(df[progress_col], df[col], s=4, alpha=0.14, label=col)
+
+        bins = np.linspace(float(df[progress_col].min()), float(df[progress_col].max()), 41)
+        tmp = df[[progress_col, col]].dropna().copy()
+        tmp["bin"] = pd.cut(tmp[progress_col], bins=bins, include_lowest=True, duplicates="drop")
+        med = tmp.groupby("bin", observed=False)[col].median()
+        ctr = np.array([interval.mid for interval in med.index], dtype=float)
+        ax.plot(ctr, med.to_numpy(dtype=float), linewidth=1.8)
+
+    ax.set_title(f"Branch masses vs {progress_col}")
+    ax.set_xlabel(progress_col)
+    ax.set_ylabel("Branch mass")
+    ax.grid(True, which="both", alpha=0.3)
+    ax.legend(fontsize=7, ncol=2)
+    _savefig(fig, plots_dir / "branch_masses_vs_progress.png")
 
 
-def plot_branchbank_run(run_dir: str | Path, *, bins: int = 40) -> Path:
-    run_dir = Path(run_dir)
-    plot_dir = _ensure_dir(run_dir / "plots")
+def plot_controls_summary(out_dir: Path, plots_dir: Path, bins: int = 60) -> Optional[Path]:
+    controls_csv = _find_controls_csv(out_dir)
+    if controls_csv is None:
+        return None
 
-    history_csv = _prefer_file(run_dir / "training_history.csv", ["*_history.csv"])
-    control_csv = _prefer_file(run_dir / "controls" / "branchbank_controls.csv", ["*_ext.csv", "*.csv"])
-    eval_csv = _prefer_file(run_dir / "eval" / "branchbank_eval.csv", ["*_eval.csv", "*.csv"])
+    df = _safe_read_csv(controls_csv)
+    if df.empty:
+        return None
 
-    # ---------------- history ----------------
+    df = _sort_controls_df(df)
+    df.to_csv(plots_dir / "controls_summary.csv", index=False)
+
+    plot_controls_vs_progress(df, plots_dir)
+    plot_control_histograms(df, plots_dir, bins=bins)
+    plot_posterior_metrics(df, plots_dir)
+    plot_branch_masses(df, plots_dir)
+
+    return controls_csv
+
+
+# =============================================================================
+# Summary writer
+# =============================================================================
+
+def write_plot_summary(out_dir: Path, plots_dir: Path) -> Path:
+    run_cfg = _load_run_config(out_dir)
+
+    summary: dict[str, object] = {
+        "out_dir": str(out_dir),
+        "files": {},
+        "metrics": {},
+        "config": {},
+    }
+
+    history_csv = _find_history_csv(out_dir)
+    eval_csv = _find_eval_csv(out_dir)
+    controls_csv = _find_controls_csv(out_dir)
+
     if history_csv is not None and history_csv.exists():
-        hist_df = pd.read_csv(history_csv)
-        if "Checkpoint" not in hist_df.columns:
-            hist_df = hist_df.copy()
-            hist_df["Checkpoint"] = np.arange(1, len(hist_df) + 1, dtype=np.int64)
-        for candidate in ["Loss", "MeanLoss", hist_df.columns[1] if len(hist_df.columns) > 1 else None]:
-            if candidate is not None and candidate in hist_df.columns:
-                plot_df = hist_df[["Checkpoint", candidate]].replace([np.inf, -np.inf], np.nan).dropna()
-                if len(plot_df) == 0:
-                    break
+        df = pd.read_csv(history_csv)
+        if not df.empty and "Loss" in df.columns:
+            summary["files"]["training_history_csv"] = str(history_csv)
+            summary["metrics"]["train_loss_first"] = float(df["Loss"].iloc[0])
+            summary["metrics"]["train_loss_last"] = float(df["Loss"].iloc[-1])
+            summary["metrics"]["train_loss_min"] = float(df["Loss"].min())
 
-                y = plot_df[candidate].to_numpy(dtype=float)
-                x = plot_df["Checkpoint"].to_numpy(dtype=float)
-
-                smooth_window = max(3, min(9, len(plot_df) // 4))
-                y_smooth = pd.Series(y).rolling(window=smooth_window, min_periods=1).mean().to_numpy()
-
-                fig, ax = plt.subplots(figsize=(5.5, 3.8), dpi=180)
-                ax.plot(x, y, linewidth=1.0, alpha=0.35, label="raw")
-                ax.plot(x, y_smooth, linewidth=2.0, label=f"{smooth_window}-pt moving avg")
-                ax.set_xlabel("Checkpoint")
-                ax.set_ylabel(candidate)
-                ax.set_title("Training history")
-                ax.grid(True, alpha=0.3)
-                ax.legend(fontsize=8, loc="best")
-                fig.tight_layout()
-                fig.savefig(plot_dir / "training_loss.png")
-                plt.close(fig)
-                break
-    # # ---------------- evaluation ----------------
-    # if eval_csv is not None and eval_csv.exists():
-    #     eval_df = pd.read_csv(eval_csv)
-    #     if {"Resources", "Weighted MSE"}.issubset(eval_df.columns):
-    #         mean_df = _resource_binned_mean(eval_df, "Resources", "Weighted MSE", bins=bins)
-    #         _save_line(
-    #             mean_df,
-    #             "Resources",
-    #             "Weighted MSE",
-    #             plot_dir / "precision_vs_resources.png",
-    #             logy=False,
-    #             title="Weighted MSE vs resources",
-    #         )
-
-    # ---------------- evaluation ----------------
     if eval_csv is not None and eval_csv.exists():
-        eval_df = pd.read_csv(eval_csv)
+        df = pd.read_csv(eval_csv)
+        if not df.empty and "Resources" in df.columns:
+            y_col = "MSE_g" if "MSE_g" in df.columns else [c for c in df.columns if c != "Resources"][0]
+            summary["files"]["eval_csv"] = str(eval_csv)
+            summary["metrics"]["eval_metric_name"] = y_col
+            summary["metrics"]["eval_first"] = float(df[y_col].iloc[0])
+            summary["metrics"]["eval_last"] = float(df[y_col].iloc[-1])
+            summary["metrics"]["eval_min"] = float(df[y_col].min())
+            summary["metrics"]["eval_resources_last"] = float(df["Resources"].iloc[-1])
 
-        metric_col = None
-        for candidate in ["MSE_g", "Weighted MSE"]:
-            if {"Resources", candidate}.issubset(eval_df.columns):
-                metric_col = candidate
-                break
+            baseline = _infer_eval_baseline(run_cfg)
+            if baseline is not None and df[y_col].iloc[-1] > 0.0:
+                summary["metrics"]["eval_prior_baseline"] = float(baseline)
+                summary["metrics"]["eval_improvement_factor_last"] = float(baseline / float(df[y_col].iloc[-1]))
 
-        if metric_col is not None:
-            mean_df = _resource_binned_mean(eval_df, "Resources", metric_col, bins=bins)
-            _save_line(
-                mean_df,
-                "Resources",
-                metric_col,
-                plot_dir / "precision_vs_resources.png",
-                logy=True,
-            )
+    if controls_csv is not None and controls_csv.exists():
+        df = pd.read_csv(controls_csv)
+        if not df.empty:
+            summary["files"]["controls_csv"] = str(controls_csv)
+            for col in ["T_s", "Bp_kTm", "mw_phase_rad", "Std_g", "BranchEntropy", "BranchDominance", "QGap12"]:
+                if col in df.columns:
+                    summary["metrics"][f"{col}_mean"] = float(df[col].mean())
+                    summary["metrics"][f"{col}_median"] = float(df[col].median())
 
-    # ---------------- controls / branch summaries ----------------
-    if control_csv is not None and control_csv.exists():
-        ctrl_df = pd.read_csv(control_csv)
+    # Minimal config echo for quick inspection
+    if run_cfg:
+        summary["config"]["run_profile"] = run_cfg.get("run_profile")
+        summary["config"]["batchsize"] = run_cfg.get("batchsize")
+        summary["config"]["iterations"] = run_cfg.get("iterations")
+        summary["config"]["interval_save"] = run_cfg.get("interval_save")
+        summary["config"]["max_steps"] = run_cfg.get("max_steps")
+        summary["config"]["max_resources"] = run_cfg.get("max_resources")
+        summary["config"]["objective_mode"] = run_cfg.get("objective_mode")
+        summary["config"]["eval_metric_mode"] = run_cfg.get("eval_metric_mode")
 
-        if {"ResOverMaxRes", "T_s"}.issubset(ctrl_df.columns):
-            df_t = _resource_binned_mean(ctrl_df, "ResOverMaxRes", "T_s", bins=bins)
-            _save_line(df_t, "ResOverMaxRes", "T_s", plot_dir / "T_vs_resources.png", title="Free-fall time vs resources")
+    out_path = plots_dir / "plot_summary.json"
+    with out_path.open("w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+    return out_path
 
-        if {"ResOverMaxRes", "Bp_kTm"}.issubset(ctrl_df.columns):
-            df_b = _resource_binned_mean(ctrl_df, "ResOverMaxRes", "Bp_kTm", bins=bins)
-            _save_line(df_b, "ResOverMaxRes", "Bp_kTm", plot_dir / "Bp_vs_resources.png", title="MFG vs resources")
 
-        if {"ResOverMaxRes", "mw_phase_rad", "BranchDominance"}.issubset(ctrl_df.columns):
-            _save_scatter(
-                ctrl_df,
-                "ResOverMaxRes",
-                "mw_phase_rad",
-                "BranchDominance",
-                plot_dir / "mw_phase_scatter.png",
-                title="Readout phase vs resources",
-            )
+# =============================================================================
+# Public entry point
+# =============================================================================
 
-        if {"ResOverMaxRes", "BranchEntropy"}.issubset(ctrl_df.columns):
-            df_ent = _resource_binned_mean(ctrl_df, "ResOverMaxRes", "BranchEntropy", bins=bins)
-            _save_line(
-                df_ent,
-                "ResOverMaxRes",
-                "BranchEntropy",
-                plot_dir / "branch_entropy_vs_resources.png",
-                title="Branch entropy vs resources",
-            )
+def plot_branchbank_run(out_dir: str | Path, bins: int = 60) -> Path:
+    """
+    Main plotting entry point used by trainer.py.
 
-        if {"ResOverMaxRes", "QGap12"}.issubset(ctrl_df.columns):
-            df_gap = _resource_binned_mean(ctrl_df, "ResOverMaxRes", "QGap12", bins=bins)
-            _save_line(
-                df_gap,
-                "ResOverMaxRes",
-                "QGap12",
-                plot_dir / "qgap12_vs_resources.png",
-                title="Top-2 branch mass gap vs resources",
-            )
+    Expected file layout:
+      out_dir/
+        run_config.json
+        *_history.csv
+        controls/branchbank_controls.csv
+        eval/branchbank_eval.csv
 
-        if {"ResOverMaxRes", "Std_g"}.issubset(ctrl_df.columns):
-            df_std_g = _resource_binned_mean(ctrl_df, "ResOverMaxRes", "Std_g", bins=bins)
-            _save_line(
-                df_std_g,
-                "ResOverMaxRes",
-                "Std_g",
-                plot_dir / "std_g_vs_resources.png",
-                title="Global posterior std(g) vs resources",
-            )
+    Returns:
+      Path to the plots directory.
+    """
+    out_dir = Path(out_dir)
+    plots_dir = _ensure_dir(out_dir / "plots")
 
-        if {"ResOverMaxRes", "Mean_g"}.issubset(ctrl_df.columns):
-            df_mean_g = _resource_binned_mean(ctrl_df, "ResOverMaxRes", "Mean_g", bins=bins)
-            _save_line(
-                df_mean_g,
-                "ResOverMaxRes",
-                "Mean_g",
-                plot_dir / "mean_g_vs_resources.png",
-                title="Global posterior mean(g) vs resources",
-            )
+    # Training history
+    try:
+        plot_training_history(out_dir, plots_dir)
+    except Exception as exc:
+        print(f"[warn] Could not plot training history: {exc}")
 
-        if {"ResOverMaxRes", "Std_A"}.issubset(ctrl_df.columns):
-            df_std_A = _resource_binned_mean(ctrl_df, "ResOverMaxRes", "Std_A", bins=bins)
-            _save_line(
-                df_std_A,
-                "ResOverMaxRes",
-                "Std_A",
-                plot_dir / "std_A_vs_resources.png",
-                title="Global posterior std(A) vs resources",
-            )
+    # Eval curve
+    try:
+        plot_eval_curve(out_dir, plots_dir)
+    except Exception as exc:
+        print(f"[warn] Could not plot evaluation curve: {exc}")
 
-        if {"ResOverMaxRes", "Mean_A"}.issubset(ctrl_df.columns):
-            df_mean_A = _resource_binned_mean(ctrl_df, "ResOverMaxRes", "Mean_A", bins=bins)
-            _save_line(
-                df_mean_A,
-                "ResOverMaxRes",
-                "Mean_A",
-                plot_dir / "mean_A_vs_resources.png",
-                title="Global posterior mean(A) vs resources",
-            )
+    # Controls / posterior summaries
+    try:
+        plot_controls_summary(out_dir, plots_dir, bins=bins)
+    except Exception as exc:
+        print(f"[warn] Could not plot controls summary: {exc}")
 
-        if {"Mean_g", "Std_g", "BranchEntropy"}.issubset(ctrl_df.columns):
-            _save_scatter(
-                ctrl_df,
-                "Mean_g",
-                "Std_g",
-                "BranchEntropy",
-                plot_dir / "ambiguity_map.png",
-                title="Ambiguity map",
-            )
+    # Summary JSON
+    try:
+        write_plot_summary(out_dir, plots_dir)
+    except Exception as exc:
+        print(f"[warn] Could not write plot summary: {exc}")
 
-        if {"Mean_A", "Std_A", "BranchEntropy"}.issubset(ctrl_df.columns):
-            _save_scatter(
-                ctrl_df,
-                "Mean_A",
-                "Std_A",
-                "BranchEntropy",
-                plot_dir / "A_uncertainty_map.png",
-                title="Visibility uncertainty map",
-            )
-
-        # branch mass curves
-        branch_mass_cols = _branch_columns(ctrl_df, "Mass")
-        if branch_mass_cols and "ResOverMaxRes" in ctrl_df.columns:
-            curves = []
-            labels = []
-            for col in branch_mass_cols:
-                tmp = _resource_binned_mean(
-                    ctrl_df[["ResOverMaxRes", col]].rename(columns={col: "Mass"}),
-                    "ResOverMaxRes",
-                    "Mass",
-                    bins=bins,
-                )
-                curves.append(tmp)
-                labels.append(col)
-            _save_multiline(
-                curves,
-                labels,
-                "ResOverMaxRes",
-                "Mass",
-                plot_dir / "branch_masses.png",
-                title="Branch masses vs resources",
-            )
-
-        # branch mean-g curves
-        branch_mean_g_cols = _branch_columns(ctrl_df, "Mean_g")
-        if branch_mean_g_cols and "ResOverMaxRes" in ctrl_df.columns:
-            curves = []
-            labels = []
-            for col in branch_mean_g_cols:
-                tmp = _resource_binned_mean(
-                    ctrl_df[["ResOverMaxRes", col]].rename(columns={col: "Mean_g"}),
-                    "ResOverMaxRes",
-                    "Mean_g",
-                    bins=bins,
-                )
-                curves.append(tmp)
-                labels.append(col)
-            _save_multiline(
-                curves,
-                labels,
-                "ResOverMaxRes",
-                "Mean_g",
-                plot_dir / "branch_mean_g.png",
-                title="Branch mean g vs resources",
-            )
-
-        # branch mean-A curves
-        branch_mean_A_cols = _branch_columns(ctrl_df, "Mean_A")
-        if branch_mean_A_cols and "ResOverMaxRes" in ctrl_df.columns:
-            curves = []
-            labels = []
-            for col in branch_mean_A_cols:
-                tmp = _resource_binned_mean(
-                    ctrl_df[["ResOverMaxRes", col]].rename(columns={col: "Mean_A"}),
-                    "ResOverMaxRes",
-                    "Mean_A",
-                    bins=bins,
-                )
-                curves.append(tmp)
-                labels.append(col)
-            _save_multiline(
-                curves,
-                labels,
-                "ResOverMaxRes",
-                "Mean_A",
-                plot_dir / "branch_mean_A.png",
-                title="Branch mean A vs resources",
-            )
-
-    return plot_dir
+    return plots_dir
