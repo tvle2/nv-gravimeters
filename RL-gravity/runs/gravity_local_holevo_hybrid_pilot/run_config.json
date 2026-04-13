@@ -1,0 +1,65 @@
+{
+  "run_profile": "pilot",
+  "run_mode": "all",
+  "noise_mode": "none",
+  "profile": {
+    "name": "pilot",
+    "out_dir": "runs/gravity_local_holevo_hybrid_pilot",
+    "batchsize": 32,
+    "iterations": 2000,
+    "interval_save": 8,
+    "max_steps": 32,
+    "max_resources": 0.08,
+    "initial_lr": 0.0002,
+    "seed": 42,
+    "gradient_accumulation": 1,
+    "n_particles": 1024,
+    "n_levels": 4,
+    "n_disambig_per_level": 7,
+    "cumulative_loss": true,
+    "baseline": true,
+    "loss_logl_outcomes": true,
+    "stop_gradient_input": true,
+    "stop_gradient_pf": false,
+    "eval_iters": 32
+  },
+  "gravimeter_cfg": {
+    "g_range": [
+      9.7806,
+      9.825
+    ],
+    "T_range_s": [
+      1e-05,
+      0.0012
+    ],
+    "Bp_range_kTm": [
+      0.5,
+      80.0
+    ],
+    "infer_phi_off": true,
+    "phi_off_range_rad": [
+      -3.141592653589793,
+      3.141592653589793
+    ],
+    "prec": "float32"
+  },
+  "bank_cfg": {
+    "n_particles": 1024,
+    "n_levels": 4,
+    "n_disambig_per_level": 7,
+    "prec": "float32",
+    "resample_threshold": 0.5,
+    "resample_alpha": 0.5,
+    "resample_beta": 0.98,
+    "scibior_trick": true,
+    "trim": true,
+    "hierarchy_bce_weight": 1.0,
+    "hierarchy_local_mse_weight": 0.05,
+    "local_holevo_weight": 0.25,
+    "gain_penalty_weight": 0.1,
+    "local_holevo_clip": 100.0,
+    "gain_ratio_limit": 1.5,
+    "bp_dis_max_ratio": 4.0,
+    "phase_residual_max_rad": 1.0995574287564276
+  }
+}

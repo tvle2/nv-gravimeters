@@ -5,9 +5,7 @@ RL-gravity/bin
 RL-gravity/include
 RL-gravity/lib
 RL-gravity/share
-RL-gravity/runs
+# RL-gravity/runs
 RL-gravity/lib64
 RL-gravity/pyvenv.cfg
-RL-gravity/runs/gravimeter_branchbank_pilot_with_decoherent
-RL-gravity/runs_old
 __pycache__/

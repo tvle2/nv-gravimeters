@@ -1,0 +1,55 @@
+{
+  "run_profile": "smoke",
+  "run_mode": "all",
+  "noise_mode": "none",
+  "profile": {
+    "batchsize": 8,
+    "iterations": 300,
+    "interval_save": 50,
+    "max_steps": 16,
+    "max_resources": 0.02,
+    "initial_lr": 0.0005,
+    "seed": 42,
+    "gradient_accumulation": 1,
+    "n_total": 128,
+    "n_min": 16,
+    "k_max": 8,
+    "top_k_modes": 4,
+    "v_h_max": 100.0,
+    "cumulative_loss": false,
+    "baseline": true,
+    "loss_logl_outcomes": true,
+    "stop_gradient_input": true,
+    "stop_gradient_pf": false
+  },
+  "gravimeter_cfg": {
+    "g_range": [
+      9.7806,
+      9.825
+    ],
+    "T_range_s": [
+      1e-05,
+      0.001
+    ],
+    "Bp_range_kTm": [
+      0.5,
+      50.0
+    ],
+    "mfg_rel_noise_bound": 0.0,
+    "sigma_omega_rel": 0.0,
+    "trap_visibility_mode": "none",
+    "T2_spin_s": null,
+    "readout_flip_prob": 0.0,
+    "prec": "float32",
+    "infer_mfg_bias": false
+  },
+  "bank_cfg": {
+    "n_total": 128,
+    "n_min": 16,
+    "k_max": 8,
+    "prune_threshold": 1e-06,
+    "split_fringes_threshold": 1.5,
+    "top_k_modes": 4,
+    "v_h_max": 100.0
+  }
+}
