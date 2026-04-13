@@ -363,7 +363,6 @@ def plot_control_histograms(df: pd.DataFrame, plots_dir: Path, bins: int = 60) -
 
     _savefig(fig, plots_dir / "controls_histograms.png")
 
-
 def plot_posterior_metrics(df: pd.DataFrame, plots_dir: Path) -> None:
     progress_col = "ResOverMaxRes" if "ResOverMaxRes" in df.columns else (
         "StepOverMaxStep" if "StepOverMaxStep" in df.columns else None
@@ -371,14 +370,18 @@ def plot_posterior_metrics(df: pd.DataFrame, plots_dir: Path) -> None:
     if progress_col is None:
         return
 
-    metric_groups = [
-        ["Std_g", "Std_A"],
-        ["BranchEntropy", "BranchDominance", "QGap12"],
-        ["Top1Mass", "Top2Mass"],
-        ["Mean_g", "Mean_A"],
+    # Prefer schema-agnostic posterior-like metrics
+    preferred_groups = [
+        ["Std_g", "Std_A", "Std_beta_B"],
+        ["Mean_g", "Mean_A", "Mean_beta_B"],
+        ["BranchEntropy", "BranchDominance", "QGap12", "Top1Mass", "Top2Mass"],
+        ["GridVarG", "GridEntropy", "GridEffN01", "GridTopWeight"],
+        ["RemainingResFrac", "BestUtilityPerRes"],
     ]
 
-    for group in metric_groups:
+    plotted_any = False
+
+    for group in preferred_groups:
         cols = [c for c in group if c in df.columns]
         if not cols:
             continue
@@ -387,7 +390,6 @@ def plot_posterior_metrics(df: pd.DataFrame, plots_dir: Path) -> None:
         for col in cols:
             ax.scatter(df[progress_col], df[col], s=4, alpha=0.18, label=col)
 
-            # Add binned median trend
             bins = np.linspace(float(df[progress_col].min()), float(df[progress_col].max()), 41)
             tmp = df[[progress_col, col]].dropna().copy()
             tmp["bin"] = pd.cut(tmp[progress_col], bins=bins, include_lowest=True, duplicates="drop")
@@ -401,14 +403,38 @@ def plot_posterior_metrics(df: pd.DataFrame, plots_dir: Path) -> None:
         ax.grid(True, which="both", alpha=0.3)
         ax.legend(fontsize=8)
         _savefig(fig, plots_dir / f"posterior_{'_'.join(cols)}_vs_{progress_col}.png")
+        plotted_any = True
+
+    # Fallback: plot any extra numeric posterior-ish columns that were not covered
+    if not plotted_any:
+        skip = {
+            progress_col, "T_s", "Bp_kTm", "mw_phase_rad", "Estimation", "g", "A", "Resources"
+        }
+        cols = [c for c in _numeric_columns(df) if c not in skip]
+        cols = cols[:6]
+        if not cols:
+            return
+
+        fig, ax = plt.subplots(figsize=(7.2, 4.8), dpi=180)
+        for col in cols:
+            ax.scatter(df[progress_col], df[col], s=4, alpha=0.18, label=col)
+        ax.set_title(f"Numeric metrics vs {progress_col}")
+        ax.set_xlabel(progress_col)
+        ax.set_ylabel("Value")
+        ax.grid(True, which="both", alpha=0.3)
+        ax.legend(fontsize=8)
+        _savefig(fig, plots_dir / "posterior_generic_vs_progress.png")
 
 
 def plot_branch_masses(df: pd.DataFrame, plots_dir: Path) -> None:
     progress_col = "ResOverMaxRes" if "ResOverMaxRes" in df.columns else (
         "StepOverMaxStep" if "StepOverMaxStep" in df.columns else None
     )
+    if progress_col is None:
+        return
+
     mass_cols = [c for c in df.columns if c.startswith("Branch") and c.endswith("_Mass")]
-    if progress_col is None or not mass_cols:
+    if not mass_cols:
         return
 
     fig, ax = plt.subplots(figsize=(7.2, 4.8), dpi=180)
@@ -422,12 +448,12 @@ def plot_branch_masses(df: pd.DataFrame, plots_dir: Path) -> None:
         ctr = np.array([interval.mid for interval in med.index], dtype=float)
         ax.plot(ctr, med.to_numpy(dtype=float), linewidth=1.8)
 
-    ax.set_title(f"Branch masses vs {progress_col}")
+    ax.set_title(f"Mixture/branch masses vs {progress_col}")
     ax.set_xlabel(progress_col)
-    ax.set_ylabel("Branch mass")
+    ax.set_ylabel("Mass")
     ax.grid(True, which="both", alpha=0.3)
     ax.legend(fontsize=7, ncol=2)
-    _savefig(fig, plots_dir / "branch_masses_vs_progress.png")
+    _savefig(fig, plots_dir / "mixture_masses_vs_progress.png")
 
 
 def plot_controls_summary(out_dir: Path, plots_dir: Path, bins: int = 60) -> Optional[Path]:
@@ -496,21 +522,28 @@ def write_plot_summary(out_dir: Path, plots_dir: Path) -> Path:
         df = pd.read_csv(controls_csv)
         if not df.empty:
             summary["files"]["controls_csv"] = str(controls_csv)
-            for col in ["T_s", "Bp_kTm", "mw_phase_rad", "Std_g", "BranchEntropy", "BranchDominance", "QGap12"]:
+
+            preferred_cols = [
+                "T_s", "Bp_kTm", "mw_phase_rad",
+                "Std_g", "Std_A", "Std_beta_B",
+                "Mean_g", "Mean_A", "Mean_beta_B",
+                "BranchEntropy", "BranchDominance", "QGap12",
+                "GridVarG", "GridEntropy", "GridEffN01", "GridTopWeight",
+                "RemainingResFrac", "BestUtilityPerRes",
+            ]
+
+            for col in preferred_cols:
                 if col in df.columns:
                     summary["metrics"][f"{col}_mean"] = float(df[col].mean())
                     summary["metrics"][f"{col}_median"] = float(df[col].median())
 
-    # Minimal config echo for quick inspection
     if run_cfg:
-        summary["config"]["run_profile"] = run_cfg.get("run_profile")
-        summary["config"]["batchsize"] = run_cfg.get("batchsize")
-        summary["config"]["iterations"] = run_cfg.get("iterations")
-        summary["config"]["interval_save"] = run_cfg.get("interval_save")
-        summary["config"]["max_steps"] = run_cfg.get("max_steps")
-        summary["config"]["max_resources"] = run_cfg.get("max_resources")
-        summary["config"]["objective_mode"] = run_cfg.get("objective_mode")
-        summary["config"]["eval_metric_mode"] = run_cfg.get("eval_metric_mode")
+        for key in [
+            "run_profile", "batchsize", "iterations", "interval_save",
+            "max_steps", "max_resources", "objective_mode", "eval_metric_mode"
+        ]:
+            if key in run_cfg:
+                summary["config"][key] = run_cfg.get(key)
 
     out_path = plots_dir / "plot_summary.json"
     with out_path.open("w", encoding="utf-8") as f:
