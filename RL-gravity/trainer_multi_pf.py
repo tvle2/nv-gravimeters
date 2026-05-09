@@ -181,7 +181,7 @@ PILOT_PROFILE = RunProfile(
     gradient_accumulation=1,
 
     n_per_mode=64,
-    k_max=64,
+    k_max=128,
 
     top_k_modes=4,
     prec="float64",
@@ -271,8 +271,8 @@ def make_gravimeter_cfg(profile: RunProfile) -> GravimeterConfig:
         g_range=(9.7806, 9.825),
         infer_mfg_bias=False,
         beta_B_range=(-0.10, 0.10),
-        T_range_s=(10e-6, 1.0e-3),
-        Bp_range_kTm=(0.5, 50.0),
+        T_range_s=(10e-6, 5e-4),
+        Bp_range_kTm=(0.5, 25.0),
         T2_spin_s=None,
         readout_flip_prob=0.0,
         dead_time_s=0.0,

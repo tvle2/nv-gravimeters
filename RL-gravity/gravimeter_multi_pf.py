@@ -897,16 +897,32 @@ class GravityMultiPFSimulation(StatelessSimulation):
                     else:
                         baseline_step = tf.zeros((), dtype=prec)
                     advantage = L_step_b - baseline_step                  # (B,)
-                    if pars.stop_gradient_pf:
-                        # Per-step log_prob (gated by continue_flag).
-                        logp_for_score = tf.where(
-                            continue_flag[:, 0],
-                            log_prob[:, 0],
-                            tf.zeros((self.bs,), dtype=prec),
-                        )
-                    else:
-                        # Cumulative log_prob across all prior steps.
-                        logp_for_score = sum_log_prob[:, 0]
+                    ####################
+                    # if pars.stop_gradient_pf:
+                    #     # Per-step log_prob (gated by continue_flag).
+                    #     logp_for_score = tf.where(
+                    #         continue_flag[:, 0],
+                    #         log_prob[:, 0],
+                    #         tf.zeros((self.bs,), dtype=prec),
+                    #     )
+                    # else:
+                    #     # Cumulative log_prob across all prior steps.
+                    #     logp_for_score = sum_log_prob[:, 0]
+                    ######################
+                    # REINFORCE score-function term: must be the CUMULATIVE
+                    # sum of log p(y_t | controls_t, theta) across all steps
+                    # in this trajectory, regardless of stop_gradient_pf.
+                    # Rationale (Belliardo 2024 SI App. D.3, Eq. 87-91):
+                    # the score function arises from differentiating
+                    #   p(trajectory) = prod_t p(y_t | controls_t, theta)
+                    # so its log is sum_t log p(y_t | ...).  Even when we
+                    # detach the bank gradient at every step, the trajectory
+                    # itself was sampled with all prior controls, and REINFORCE
+                    # attributes each outcome's randomness to whichever
+                    # controls produced it.  Using only the per-step term
+                    # drops legitimate gradient contributions and biases
+                    # the optimizer toward myopic behavior.
+                    logp_for_score = sum_log_prob[:, 0]
                     inv_meanL = 1.0 / tf.stop_gradient(
                         tf.maximum(mean_L_step, tf.cast(1e-30, prec))
                     )
