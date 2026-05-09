@@ -5,7 +5,7 @@ RL-gravity/bin
 RL-gravity/include
 RL-gravity/lib
 RL-gravity/share
-# RL-gravity/runs
+RL-gravity/runs
 RL-gravity/lib64
 RL-gravity/pyvenv.cfg
 __pycache__/

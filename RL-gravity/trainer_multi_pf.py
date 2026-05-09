@@ -1,80 +1,46 @@
-"""Training script for the Multi-PF Bank quantum gravity sensor.
+# trainer_multi_pf.py
+"""Trainer for the levitated-NV gravimeter Multi-PF agent.
 
-Wires the :class:`~gravimeter_multi_pf.GravityMultiPFSimulation` into
-qsensoropt's ``utils.train()`` training loop.
+Defaults follow the design decisions locked with the user:
+  * K=k_max sub-PFs fixed for the entire episode (no pruning, no splitting).
+  * Two-scale log-Holevo loss (coarsest scale + current-step k_g).
+  * Log-cumulative training loss (Belliardo 2024 Eq. 109).
+  * REINFORCE surrogate, with per-step log_prob when stop_gradient_pf=True
+    (the recommended default) or cumulative sum_log_prob when False.
+  * Within-mode resampling stays ESS-triggered.  Scibior-Wood is OFF
+    because the loss is non-polynomial in the within-mode weights.
+  * Default precision: float64.
+  * Default optimizer: Adam(InverseSqrtDecay) with global-norm clip 1.0.
 
-Usage
------
-::
-
-    # Pilot run (fast, 2000 iterations, small batch)
-    RUN_PROFILE = "pilot"
-    python trainer_multi_pf.py
-
-    # Full run (50000 iterations, larger batch)
-    RUN_PROFILE = "full"
-    python trainer_multi_pf.py
-
-Configuration
--------------
-All training hyperparameters are captured in frozen :class:`RunProfile`
-dataclasses (:data:`PILOT_PROFILE`, :data:`FULL_PROFILE`).
-
-The top-level flags ``RUN_PROFILE``, ``NOISE_MODE``, and ``RUN_MODE`` can be
-edited to select the desired configuration without touching any other code.
-
-Architecture summary
---------------------
-* Physical model: :class:`~gravimeter_model.GravityStatelessPhysicalModel`
-* Bank:           :class:`~gravimeter_multi_pf.MultiPFBank`
-* Simulation:     :class:`~gravimeter_multi_pf.GravityMultiPFSimulation`
-* Controller:     MLP ``Dense(128,tanh) → Dense(128,tanh) → Dense(64,tanh)
-  → Dense(3,tanh)`` (4 * TOP_K_MODES + 5 → 3 controls)
-* Loss:           Holevo variance ``V_H = |μ_H|^{-2} - 1`` (Berry & Sanders 2009)
-* Training:       REINFORCE + model-aware gradients, Adam with inverse-sqrt
-  learning-rate decay (Belliardo et al. 2024)
-
-References
-----------
-Belliardo et al. (2024). Physical Review A 109, 062609.
-  https://doi.org/10.1103/PhysRevA.109.062609
-
-Berry & Sanders (2009). Physical Review A 80, 052114.
-  https://arxiv.org/abs/0907.0014
+Reference
+---------
+Belliardo et al. (2024). Phys. Rev. A 109, 062609.
 """
-
 from __future__ import annotations
 
+import importlib.util
+import json
 import os
 import random
-import shutil
+import sys
+import types
 from dataclasses import dataclass
 from pathlib import Path
+from typing import List, Optional
 
 import numpy as np
 import tensorflow as tf
-from tqdm.auto import tqdm, trange
+from tqdm.auto import trange
 
-# Suppress TF info/warning logs
+# --- Quiet TF and avoid the SVD-on-1-column op-determinism crash. ---
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
-# NOTE: TF_DETERMINISTIC_OPS is intentionally NOT set.
-# TF's deterministic SVD does not support matrices with 1 column,
-# which triggers an UnimplementedError in qsensoropt's Liu-West
-# jittering (sqrt_hmatrix → SVD) when d=1 (single-parameter g).
-# Reproducibility is ensured via explicit seeds instead.
 os.environ.pop("TF_DETERMINISTIC_OPS", None)
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 
 # ---------------------------------------------------------------------------
-# Imports from qsensoropt and our modules
+# qsensoropt loader
 # ---------------------------------------------------------------------------
-
-import importlib.util
-import sys
-import types
-import json
-
 
 def _load_local_qsensoropt_module(module_name: str):
     root = Path(__file__).resolve().parent
@@ -99,11 +65,9 @@ def _load_local_qsensoropt_module(module_name: str):
 
 
 try:
-    from qsensoropt.utils import train
     from qsensoropt.simulation_parameters import SimulationParameters
     from qsensoropt.schedulers import InverseSqrtDecay
 except Exception:
-    train = _load_local_qsensoropt_module("utils").train
     SimulationParameters = _load_local_qsensoropt_module(
         "simulation_parameters"
     ).SimulationParameters
@@ -121,76 +85,23 @@ from gravimeter_multi_pf import (
 # Top-level mode flags
 # ---------------------------------------------------------------------------
 
-#: Select training profile: ``"smoke"``, ``"pilot"``, or ``"full"``.
+#: Select training profile: "smoke", "pilot", or "full".
 RUN_PROFILE: str = "pilot"
 
-#: ``"all"`` | ``"train-only"`` | ``"eval-only"``
+#: "all" | "train-only" | "eval-only"
 RUN_MODE: str = "all"
 
-#: ``"none"`` | ``"paper"``  (paper = realistic sensor noise from Belliardo 2024)
+#: "none" | "paper"  (paper = realistic sensor noise)
 NOISE_MODE: str = "none"
 
 
 # ---------------------------------------------------------------------------
-# Run profile dataclass
+# RunProfile
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class RunProfile:
-    """Complete specification of a training run.
-
-    Parameters
-    ----------
-    name : str
-        Human-readable name used in log messages and file names.
-    out_dir : str
-        Output directory for checkpoints, loss history, and weights.
-    batchsize : int
-        Number of parallel estimation episodes per gradient step.
-    iterations : int
-        Total number of gradient update steps.
-    interval_save : int
-        Save checkpoint every this many iterations.
-    max_steps : int
-        Maximum number of measurement steps per episode.
-    max_resources : float
-        Maximum resource budget per episode (seconds of measurement time).
-    initial_lr : float
-        Initial learning rate for :class:`~.InverseSqrtDecay`.
-    seed : int
-        Global random seed.
-    gradient_accumulation : int
-        Number of ``execute()`` calls per gradient update (effective batchsize
-        multiplier).
-
-    n_total : int
-        Total particle budget across all modes in the bank.
-    n_min : int
-        Minimum particles per active mode.
-    k_max : int
-        Maximum simultaneous modes.
-
-    top_k_modes : int
-        Number of top-weighted modes included in the controller input.
-    v_h_max : float
-        Holevo variance clipping threshold.
-
-    cumulative_loss : bool
-        If ``True``, accumulate loss at every step (recommended for
-        coarse-to-fine learning).
-    baseline : bool
-        If ``True``, subtract the batch mean from the REINFORCE loss term.
-    loss_logl_outcomes : bool
-        Mix outcome log-likelihood into the loss (required for REINFORCE).
-    stop_gradient_input : bool
-        Stop gradient through the NN input (saves memory).
-    stop_gradient_pf : bool
-        Stop gradient through the particle filter Bayes update.
-
-    eval_iters : int
-        Number of evaluation batches for performance estimation.
-    """
-
+    """Complete specification of a training run."""
     name: str
     out_dir: str
     batchsize: int
@@ -199,17 +110,17 @@ class RunProfile:
     max_steps: int
     max_resources: float
     initial_lr: float
+    grad_clip_norm: float
     seed: int
     gradient_accumulation: int
 
-    # Bank settings
-    n_total: int
-    n_min: int
+    # Bank
+    n_per_mode: int
     k_max: int
 
     # Controller / loss
     top_k_modes: int
-    v_h_max: float
+    prec: str  # "float32" | "float64"
 
     # Training flags
     cumulative_loss: bool
@@ -223,99 +134,102 @@ class RunProfile:
 
 
 # ---------------------------------------------------------------------------
-# Predefined profiles
+# Profiles
 # ---------------------------------------------------------------------------
 
+# Smoke: minimal — for verifying nothing is broken.
 SMOKE_PROFILE = RunProfile(
     name="smoke",
     out_dir="runs/gravity_multi_pf_smoke",
-    batchsize=8,
-    iterations=300,
-    interval_save=50,
-    max_steps=16,             # short episodes → ~4× faster per iteration
-    max_resources=0.02,       # 20 ms — enough for ~16 low-gain shots
-    initial_lr=5e-4,          # higher LR for fast convergence
-    seed=42,
-    gradient_accumulation=1,  # no accumulation → 2× faster per iteration
-
-    n_total=128,              # small PF → fast Bayes updates
-    n_min=16,
-    k_max=8,                  # budget: 128/16 = 8 modes max
-
-    top_k_modes=4,
-    v_h_max=100.0,
-
-    cumulative_loss=False,    # terminal loss — stronger RL signal
-    baseline=True,
-    loss_logl_outcomes=True,
-    stop_gradient_input=True,
-    stop_gradient_pf=False,
-
-    eval_iters=16,
-)
-
-PILOT_PROFILE = RunProfile(
-    name="pilot",
-    out_dir="runs/gravity_multi_pf_pilot",
-    batchsize=8,
-    iterations=800,
-    interval_save=50,
-    max_steps=32,
-    max_resources=0.08,       # 80 ms total measurement time
-    initial_lr=3e-4,
+    batchsize=4,
+    iterations=40,
+    interval_save=10,
+    max_steps=6,
+    max_resources=1.0,
+    initial_lr=1e-3,
+    grad_clip_norm=1.0,
     seed=42,
     gradient_accumulation=1,
 
-    n_total=512,              # more particles for better per-mode ESS
-    n_min=32,
-    k_max=8,                  # budget: 512/32 = 16, but 8 is cleaner
+    n_per_mode=32,
+    k_max=8,
 
     top_k_modes=4,
-    v_h_max=100.0,
-
-    cumulative_loss=False,    # terminal loss — stronger RL signal
-    baseline=True,
-    loss_logl_outcomes=True,
-    stop_gradient_input=True,
-    stop_gradient_pf=False,
-
-    eval_iters=32,
-)
-
-FULL_PROFILE = RunProfile(
-    name="full",
-    out_dir="runs/gravity_multi_pf_full",
-    batchsize=64,
-    iterations=50000,
-    interval_save=256,
-    max_steps=128,
-    max_resources=0.16,       # 160 ms total measurement time
-    initial_lr=1e-3,
-    seed=123,
-    gradient_accumulation=4,
-
-    n_total=2048,
-    n_min=32,
-    k_max=64,
-
-    top_k_modes=4,
-    v_h_max=100.0,
+    prec="float64",
 
     cumulative_loss=True,
     baseline=True,
     loss_logl_outcomes=True,
     stop_gradient_input=True,
-    stop_gradient_pf=False,
+    stop_gradient_pf=True,        # 1-step BPTT — required for stability
+
+    eval_iters=8,
+)
+
+# Pilot: a real (small) training run.  ~1h on a single GPU, ~5–10h on CPU.
+PILOT_PROFILE = RunProfile(
+    name="pilot",
+    out_dir="runs/gravity_multi_pf_pilot",
+    batchsize=32,
+    iterations=2000,
+    interval_save=100,
+    max_steps=32,
+    max_resources=10.0,           # effectively no resource cap
+    initial_lr=1e-3,
+    grad_clip_norm=1.0,
+    seed=42,
+    gradient_accumulation=1,
+
+    n_per_mode=64,
+    k_max=64,
+
+    top_k_modes=4,
+    prec="float64",
+
+    cumulative_loss=True,
+    baseline=True,
+    loss_logl_outcomes=True,
+    stop_gradient_input=True,
+    stop_gradient_pf=True,
+
+    eval_iters=64,
+)
+
+# Full: production run.
+FULL_PROFILE = RunProfile(
+    name="full",
+    out_dir="runs/gravity_multi_pf_full",
+    batchsize=64,
+    iterations=20000,
+    interval_save=200,
+    max_steps=64,
+    max_resources=20.0,
+    initial_lr=1e-3,
+    grad_clip_norm=1.0,
+    seed=123,
+    gradient_accumulation=2,
+
+    n_per_mode=64,
+    k_max=128,
+
+    top_k_modes=4,
+    prec="float64",
+
+    cumulative_loss=True,
+    baseline=True,
+    loss_logl_outcomes=True,
+    stop_gradient_input=True,
+    stop_gradient_pf=True,
 
     eval_iters=256,
 )
 
 
 # ---------------------------------------------------------------------------
-# Configuration helpers
+# Helpers
 # ---------------------------------------------------------------------------
 
-def _append_jsonl(path: Path, records: list[dict]) -> None:
+def _append_jsonl(path: Path, records: List[dict]) -> None:
     if not records:
         return
     with open(path, "a", encoding="utf-8") as f:
@@ -323,49 +237,17 @@ def _append_jsonl(path: Path, records: list[dict]) -> None:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
-def _jsonl_to_json(jsonl_path: Path, json_path: Path) -> None:
-    if not jsonl_path.exists():
-        return
-    rows = []
-    with open(jsonl_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                rows.append(json.loads(line))
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(rows, f, indent=2, ensure_ascii=False)
-
-
 def set_global_reproducibility(seed: int) -> None:
-    """Set all global random seeds for reproducibility.
-
-    Parameters
-    ----------
-    seed : int
-        Base random seed.
-    """
     os.environ["PYTHONHASHSEED"] = str(seed)
     random.seed(seed)
     np.random.seed(seed)
     tf.keras.utils.set_random_seed(seed)
-    try:
-        tf.config.experimental.enable_op_determinism()
-    except Exception:
-        pass
+    # NOT enable_op_determinism(): TF deterministic SVD breaks on
+    # 1-column matrices, which qsensoropt's Liu-West jittering hits
+    # whenever d=1 (single-parameter g).
 
 
 def get_profile() -> RunProfile:
-    """Return the :class:`RunProfile` selected by the ``RUN_PROFILE`` flag.
-
-    Returns
-    -------
-    RunProfile
-
-    Raises
-    ------
-    ValueError
-        If ``RUN_PROFILE`` is not a recognized key.
-    """
     key = RUN_PROFILE.strip().lower()
     if key == "smoke":
         return SMOKE_PROFILE
@@ -378,19 +260,8 @@ def get_profile() -> RunProfile:
     )
 
 
-def make_gravimeter_cfg() -> GravimeterConfig:
-    """Construct the :class:`~gravimeter_model.GravimeterConfig` from
-    the ``NOISE_MODE`` flag.
-
-    Returns
-    -------
-    GravimeterConfig
-
-    Raises
-    ------
-    ValueError
-        If ``NOISE_MODE`` is not recognized.
-    """
+def make_gravimeter_cfg(profile: RunProfile) -> GravimeterConfig:
+    """Build the GravimeterConfig from NOISE_MODE and the profile prec."""
     common = dict(
         omega_rad_s=2.0 * np.pi * 10e3,
         gamma_e_rad_s_T=2.0 * np.pi * 28e9,
@@ -407,11 +278,9 @@ def make_gravimeter_cfg() -> GravimeterConfig:
         dead_time_s=0.0,
         mfg_resource_cost_s_at_ref=0.0,
         mfg_resource_ref_kTm=50.0,
-        prec="float32",
+        prec=profile.prec,
     )
-
     mode = NOISE_MODE.strip().lower()
-
     if mode == "none":
         return GravimeterConfig(
             **common,
@@ -423,7 +292,6 @@ def make_gravimeter_cfg() -> GravimeterConfig:
             trap_visibility_mode="none",
             trap_noise_quad_points=1,
         )
-
     if mode == "paper":
         return GravimeterConfig(
             **common,
@@ -435,62 +303,33 @@ def make_gravimeter_cfg() -> GravimeterConfig:
             trap_visibility_mode="exact_single_delta",
             trap_noise_quad_points=9,
         )
-
-    raise ValueError(
-        f"Unknown NOISE_MODE={NOISE_MODE!r}. Choose 'none' or 'paper'."
-    )
+    raise ValueError(f"Unknown NOISE_MODE={NOISE_MODE!r}")
 
 
 def make_bank_cfg(profile: RunProfile) -> MultiPFBankConfig:
-    """Construct :class:`~gravimeter_multi_pf.MultiPFBankConfig` from a
-    :class:`RunProfile`.
-
-    Parameters
-    ----------
-    profile : RunProfile
-
-    Returns
-    -------
-    MultiPFBankConfig
-    """
     return MultiPFBankConfig(
-        n_total=profile.n_total,
-        n_min=profile.n_min,
+        n_per_mode=profile.n_per_mode,
         k_max=profile.k_max,
-        prune_threshold=1e-6,
-        split_fringes_threshold=1.5,
+        n_scales=None,                  # unused with the new two-scale loss
         top_k_modes=profile.top_k_modes,
-        v_h_max=profile.v_h_max,
         resample_threshold=0.5,
         resample_alpha=0.5,
         resample_beta=0.98,
-        scibior_trick=True,
+        scibior_trick=False,            # disabled: loss is non-polynomial in weights
         trim=True,
     )
 
 
-def make_sim_pars(profile: RunProfile, cfg: GravimeterConfig) -> SimulationParameters:
-    """Construct :class:`~.SimulationParameters` from a :class:`RunProfile`.
-
-    Parameters
-    ----------
-    profile : RunProfile
-    cfg : GravimeterConfig
-        Used to read the precision string.
-
-    Returns
-    -------
-    SimulationParameters
-    """
+def make_sim_pars(profile: RunProfile) -> SimulationParameters:
     return SimulationParameters(
         sim_name=f"gravity_multi_pf_{profile.name}",
         num_steps=profile.max_steps,
         max_resources=profile.max_resources,
         resources_fraction=1.0,
-        prec=cfg.prec,
+        prec=profile.prec,
         stop_gradient_input=profile.stop_gradient_input,
         loss_logl_outcomes=profile.loss_logl_outcomes,
-        loss_logl_controls=False,     # continuous controls
+        loss_logl_controls=False,
         cumulative_loss=profile.cumulative_loss,
         baseline=profile.baseline,
         stop_gradient_pf=profile.stop_gradient_pf,
@@ -500,332 +339,31 @@ def make_sim_pars(profile: RunProfile, cfg: GravimeterConfig) -> SimulationParam
 
 
 # ---------------------------------------------------------------------------
-# Training entry point
+# Save helpers
 # ---------------------------------------------------------------------------
 
-def run_training(profile: RunProfile) -> None:
-    """Run the full training pipeline for one :class:`RunProfile`.
-
-    Steps:
-
-    1. Create output directory and save configuration.
-    2. Build :class:`~gravimeter_model.GravityStatelessPhysicalModel`,
-       :class:`~gravimeter_multi_pf.MultiPFBank`,
-       :class:`~gravimeter_multi_pf.GravityMultiPFSimulation`, and
-       the MLP controller.
-    3. Run the custom eager training loop (calls ``simulation.execute()``
-       in ``GradientTape`` context, applies gradients via Adam optimizer).
-       We use a custom eager loop instead of ``utils.train()`` because the
-       Multi-PF bank's Python-level state management (list operations,
-       ``tf.Variable`` in-place updates, ``.numpy()`` calls for split
-       decisions) is incompatible with ``@tf.function`` tracing.
-    4. Save final controller weights.
-
-    Parameters
-    ----------
-    profile : RunProfile
-        Fully specified training configuration.
-    """
-    out_dir = Path(profile.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    print("=" * 72)
-    print(f"Run profile : {profile.name}")
-    print(f"Noise mode  : {NOISE_MODE}")
-    print(f"Run mode    : {RUN_MODE}")
-    print(f"Output dir  : {out_dir.resolve()}")
-    print("=" * 72)
-
-    # --- Configuration ---
-    cfg = make_gravimeter_cfg()
-    bank_cfg = make_bank_cfg(profile)
-    simpars = make_sim_pars(profile, cfg)
-
-    rangen = tf.random.Generator.from_seed(profile.seed)
-
-    # --- Build all components ---
-    simulation, bank, controller = build_gravity_multi_pf_simulation(
-        batchsize=profile.batchsize,
-        cfg=cfg,
-        bank_cfg=bank_cfg,
-        simpars=simpars,
-        rangen=rangen,
-    )
-
-    variables = controller.trainable_variables
-    print(
-        f"[info] Controller parameters: "
-        f"{sum(int(np.prod(v.shape)) for v in variables):,}"
-    )
-    print(
-        f"[info] Bank: N_total={bank_cfg.n_total}, K_max={bank_cfg.k_max}, "
-        f"N_min={bank_cfg.n_min}"
-    )
-    print(
-        f"[info] Simulation: {simpars.num_steps} steps, "
-        f"max_resources={simpars.max_resources:.3f} s, "
-        f"batch={profile.batchsize}"
-    )
-
-    # --- Optimizer ---
-    lr_schedule = InverseSqrtDecay(
-        initial_learning_rate=profile.initial_lr,
-        prec=cfg.prec,
-    )
-    optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
-
-    # --- Training checkpoint directory ---
-    sim_str = str(simulation)
-    ckpt_dir = out_dir / f"{sim_str}_history_weights"
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-
-    # --- Eager training loop ---
-    # The Multi-PF bank uses Python-level state manipulation (.numpy() calls,
-    # list operations), which is incompatible with tf.function tracing.
-    # We therefore run the training in eager mode, which is fully supported
-    # by TensorFlow and still benefits from GPU acceleration for tensor ops.
-    #
-    # For XLA-compatible training (Phase 6 of the redesign roadmap), the bank
-    # state would need to be flattened into loop-variable tensors as described
-    # in Section 6.3 of MULTI_PF_REDESIGN.md.
-    loss_history = []
-
-    train_debug_jsonl = out_dir / "train_debug.jsonl"
-    rollout_debug_jsonl = out_dir / "rollout_debug.jsonl"
-
-    # start fresh
-    for p in (train_debug_jsonl, rollout_debug_jsonl):
-        if p.exists():
-            p.unlink()
-
-    # def single_step_eager() -> float:
-    #     """One gradient accumulation step (eager)."""
-    #     acc_loss = 0.0
-    #     acc_grads = [tf.zeros_like(v) for v in variables]
-    #     for _ in range(profile.gradient_accumulation):
-    #         with tf.GradientTape() as tape:
-    #             loss_diff, loss = simulation.execute(rangen)
-    #         grads = tape.gradient(loss_diff, variables)
-    #         # Guard against None gradients (can occur for unused variables)
-    #         grads = [g if g is not None else tf.zeros_like(v)
-    #                  for g, v in zip(grads, variables)]
-    #         acc_loss += float(loss.numpy())
-    #         acc_grads = [ag + g for ag, g in zip(acc_grads, grads)]
-    #     # Average gradients over accumulation steps
-    #     acc_grads = [g / profile.gradient_accumulation for g in acc_grads]
-    #     optimizer.apply_gradients(zip(acc_grads, variables))
-    #     return acc_loss / profile.gradient_accumulation
-    def single_step_eager(debug: bool = False):
-        """One gradient accumulation step (eager)."""
-        acc_loss = 0.0
-        acc_grads = [tf.zeros_like(v) for v in variables]
-        step_debug_records = []
-
-        for acc_i in range(profile.gradient_accumulation):
-            with tf.GradientTape() as tape:
-                if debug and acc_i == profile.gradient_accumulation - 1:
-                    loss_diff, loss, dbg = simulation.execute(
-                        rangen,
-                        debug=True,
-                        debug_max_examples=3,
-                    )
-                    step_debug_records.extend(dbg)
-                else:
-                    loss_diff, loss = simulation.execute(rangen)
-
-            grads = tape.gradient(loss_diff, variables)
-            grads = [g if g is not None else tf.zeros_like(v)
-                     for g, v in zip(grads, variables)]
-
-            # replace non-finite grads with zero so logging is stable
-            grads = [
-                tf.where(tf.math.is_finite(g), g, tf.zeros_like(g))
-                for g in grads
-            ]
-
-            acc_loss += float(loss.numpy())
-            acc_grads = [ag + g for ag, g in zip(acc_grads, grads)]
-
-        acc_grads = [g / profile.gradient_accumulation for g in acc_grads]
-        grad_norm = float(tf.linalg.global_norm(acc_grads).numpy())
-        optimizer.apply_gradients(zip(acc_grads, variables))
-
-        return (
-            acc_loss / profile.gradient_accumulation,
-            grad_norm,
-            step_debug_records,
-        )
-    
-
-    best_loss = float("inf")
-    best_ckpt_idx = 1
-
-    pbar = trange(profile.iterations, desc="Training", unit="step")
-    for j in pbar:
-        debug_now = ((j + 1) % profile.interval_save == 0)
-        step_loss, grad_norm, step_debug_records = single_step_eager(debug=debug_now)
-        loss_history.append(step_loss)
-
-        # Update progress bar with current metrics
-        recent = np.mean(loss_history[max(0, j - 9) : j + 1])
-        try:
-            # TF ≥ 2.11: optimizer.learning_rate is a tensor, use schedule directly
-            lr_val = float(lr_schedule(optimizer.iterations).numpy())
-        except Exception:
-            lr_val = float(optimizer.learning_rate.numpy())
-        pbar.set_postfix(
-            loss=f"{step_loss:.4f}",
-            avg10=f"{recent:.4f}",
-            best=f"{best_loss:.4f}",
-            lr=f"{lr_val:.1e}",
-        )
-
-        train_record = {
-            "iter": int(j + 1),
-            "loss": float(step_loss),
-            "avg10": float(recent),
-            "best": float(best_loss) if np.isfinite(best_loss) else None,
-            "grad_norm": float(grad_norm),
-            "lr": float(lr_val),
-            "bank_k_active": int(bank.k_active),
-            "mean_q0": float(tf.reduce_mean(bank.mode_weights[:, 0]).numpy()),
-            "mean_V_H": float(
-                tf.reduce_mean(
-                    bank.holevo_variance(
-                        tf.cast(
-                            2.0 * np.pi / max(simulation.g_hi - simulation.g_lo, 1e-10),
-                            simulation.simpars.prec,
-                        ) * tf.ones((profile.batchsize,), dtype=simulation.simpars.prec)
-                    )
-                ).numpy()
-            ),
-        }
-        _append_jsonl(train_debug_jsonl, [train_record])
-        if step_debug_records:
-            for rec in step_debug_records:
-                rec["train_iter"] = int(j + 1)
-            _append_jsonl(rollout_debug_jsonl, step_debug_records)
-
-        # Save checkpoint every interval_save iterations
-        if (j + 1) % profile.interval_save == 0:
-            ckpt_idx = (j + 1) // profile.interval_save
-            ckpt_path = ckpt_dir / str(ckpt_idx)
-            controller.save_weights(
-                str(ckpt_path) + ".weights.h5"
-            )
-            # Track best checkpoint by window-mean loss
-            window_start = max(0, j + 1 - profile.interval_save)
-            window_loss = float(np.mean(loss_history[window_start : j + 1]))
-            if window_loss < best_loss:
-                best_loss = window_loss
-                best_ckpt_idx = ckpt_idx
-
-    pbar.close()
-    print("[training] Done.")
-
-    # --- Load best checkpoint ---
-    best_path = ckpt_dir / f"{best_ckpt_idx}.weights.h5"
-    if best_path.exists():
-        controller.load_weights(str(best_path))
-        print(f"[ok] Loaded best checkpoint (idx={best_ckpt_idx}, "
-              f"window_loss={best_loss:.4f}) from {best_path}")
-
-    # Clean up checkpoint directory
-    for f in ckpt_dir.glob("*.h5"):
-        f.unlink(missing_ok=True)
-    try:
-        ckpt_dir.rmdir()
-    except OSError:
-        pass  # non-empty directory, leave it
-
-    # --- Save final weights ---
-    weights_path = out_dir / f"gravity_multi_pf_{profile.name}_final.weights.h5"
-    controller.save_weights(str(weights_path))
-    print(f"[ok] Saved controller weights to {weights_path}")
-
-    # --- Save loss history CSV ---
-    _save_loss_history(out_dir, sim_str, loss_history, profile.interval_save)
-
-    # --- Save run config ---
-    _save_run_config(out_dir, profile=profile, cfg=cfg, bank_cfg=bank_cfg)
-    print(f"[done] All outputs saved to {out_dir.resolve()}")
-
-
-def _save_loss_history(
-    out_dir: Path,
-    sim_str: str,
-    loss_history: list,
-    interval_save: int,
-) -> None:
-    """Save loss history as a CSV file (compatible with ``utils.train`` output).
-
-    Parameters
-    ----------
-    out_dir : Path
-    sim_str : str
-        Simulation string identifier (from ``str(simulation)``).
-    loss_history : list of float
-    interval_save : int
-        Window size for computing block averages.
-    """
-    import pandas as pd
+def _save_loss_history(out_dir: Path, sim_str: str, loss_history: list, interval: int) -> None:
     arr = np.array(loss_history)
-    num_blocks = len(arr) // interval_save
-    if num_blocks == 0:
+    n_blocks = len(arr) // max(interval, 1)
+    if n_blocks == 0:
         return
-    arr_trimmed = arr[: num_blocks * interval_save]
-    blocks = arr_trimmed.reshape(num_blocks, interval_save)
-    mean_loss = blocks.mean(axis=1)
-    df = pd.DataFrame({"Loss": mean_loss})
+    blocks = arr[: n_blocks * interval].reshape(n_blocks, interval)
+    means = blocks.mean(axis=1)
     csv_path = out_dir / f"{sim_str}_history.csv"
-    df.to_csv(str(csv_path), index=False, float_format="%.4e")
+    with open(csv_path, "w") as f:
+        f.write("Loss\n")
+        for v in means:
+            f.write(f"{v:.6e}\n")
     print(f"[ok] Saved loss history to {csv_path}")
 
 
-def _save_run_config(
-    out_dir: Path,
-    *,
-    profile: RunProfile,
-    cfg: GravimeterConfig,
-    bank_cfg: MultiPFBankConfig,
-) -> None:
-    """Save a human-readable JSON config file to the output directory.
-
-    Parameters
-    ----------
-    out_dir : Path
-        Output directory.
-    profile : RunProfile
-    cfg : GravimeterConfig
-    bank_cfg : MultiPFBankConfig
-    """
-    import json
-    from dataclasses import asdict
-
+def _save_run_config(out_dir: Path, *, profile: RunProfile,
+                     cfg: GravimeterConfig, bank_cfg: MultiPFBankConfig) -> None:
     config = {
         "run_profile": profile.name,
         "run_mode": RUN_MODE,
         "noise_mode": NOISE_MODE,
-        "profile": {
-            "batchsize": profile.batchsize,
-            "iterations": profile.iterations,
-            "interval_save": profile.interval_save,
-            "max_steps": profile.max_steps,
-            "max_resources": profile.max_resources,
-            "initial_lr": profile.initial_lr,
-            "seed": profile.seed,
-            "gradient_accumulation": profile.gradient_accumulation,
-            "n_total": profile.n_total,
-            "n_min": profile.n_min,
-            "k_max": profile.k_max,
-            "top_k_modes": profile.top_k_modes,
-            "v_h_max": profile.v_h_max,
-            "cumulative_loss": profile.cumulative_loss,
-            "baseline": profile.baseline,
-            "loss_logl_outcomes": profile.loss_logl_outcomes,
-            "stop_gradient_input": profile.stop_gradient_input,
-            "stop_gradient_pf": profile.stop_gradient_pf,
-        },
+        "profile": {k: getattr(profile, k) for k in profile.__dataclass_fields__},
         "gravimeter_cfg": {
             "g_range": list(cfg.g_range),
             "T_range_s": list(cfg.T_range_s),
@@ -839,139 +377,276 @@ def _save_run_config(
             "infer_mfg_bias": cfg.infer_mfg_bias,
         },
         "bank_cfg": {
-            "n_total": bank_cfg.n_total,
-            "n_min": bank_cfg.n_min,
+            "n_per_mode": bank_cfg.n_per_mode,
             "k_max": bank_cfg.k_max,
-            "prune_threshold": bank_cfg.prune_threshold,
-            "split_fringes_threshold": bank_cfg.split_fringes_threshold,
             "top_k_modes": bank_cfg.top_k_modes,
-            "v_h_max": bank_cfg.v_h_max,
+            "scibior_trick": bank_cfg.scibior_trick,
         },
     }
-
-    cfg_path = out_dir / "run_config.json"
-    with open(cfg_path, "w") as f:
+    with open(out_dir / "run_config.json", "w") as f:
         json.dump(config, f, indent=2)
-    print(f"[ok] Saved run config to {cfg_path}")
 
 
 # ---------------------------------------------------------------------------
-# Evaluation helper
+# Training
+# ---------------------------------------------------------------------------
+
+def simulation_str(profile: RunProfile) -> str:
+    return f"gravity_multi_pf_{profile.name}"
+
+
+def run_training(profile: RunProfile) -> None:
+    out_dir = Path(profile.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    print("=" * 72)
+    print(f"Run profile : {profile.name}")
+    print(f"Noise mode  : {NOISE_MODE}")
+    print(f"Run mode    : {RUN_MODE}")
+    print(f"Output dir  : {out_dir.resolve()}")
+    print(f"Precision   : {profile.prec}")
+    print(f"Batch size  : {profile.batchsize}")
+    print(f"K modes     : {profile.k_max}")
+    print(f"N per mode  : {profile.n_per_mode}")
+    print(f"Episode len : {profile.max_steps}")
+    print(f"Iterations  : {profile.iterations}")
+    print("=" * 72)
+
+    cfg = make_gravimeter_cfg(profile)
+    bank_cfg = make_bank_cfg(profile)
+    simpars = make_sim_pars(profile)
+
+    rangen = tf.random.Generator.from_seed(profile.seed)
+    sim, bank, controller = build_gravity_multi_pf_simulation(
+        batchsize=profile.batchsize,
+        cfg=cfg, bank_cfg=bank_cfg, simpars=simpars, rangen=rangen,
+    )
+    variables = controller.trainable_variables
+    print(f"[info] Controller params: "
+          f"{sum(int(np.prod(v.shape)) for v in variables):,}")
+    print(f"[info] Coarsest k_ref = {float(sim._k_ref_coarsest):.3e}, "
+          f"k_g_max = {sim._k_g_max:.3e}")
+
+    lr_schedule = InverseSqrtDecay(
+        initial_learning_rate=profile.initial_lr,
+        prec=profile.prec,
+    )
+    optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
+
+    sim_str = simulation_str(profile)
+    ckpt_dir = out_dir / f"{sim_str}_history_weights"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    train_debug_jsonl = out_dir / "train_debug.jsonl"
+    rollout_debug_jsonl = out_dir / "rollout_debug.jsonl"
+    for p in (train_debug_jsonl, rollout_debug_jsonl):
+        if p.exists():
+            p.unlink()
+
+    # --- EMA baseline for REINFORCE ---
+    dtype_t = tf.float32 if profile.prec == "float32" else tf.float64
+    ema_baseline = tf.Variable(0.0, dtype=dtype_t, trainable=False, name="ema_baseline")
+    ema_initialized = tf.Variable(False, trainable=False, name="ema_initialized")
+    ema_decay = tf.constant(0.95, dtype=dtype_t)
+
+    def single_step_eager(debug: bool = False):
+        """One gradient-accumulation step.  Returns (avg_loss, raw_grad_norm,
+        clipped_grad_norm, debug_records)."""
+        acc_loss = 0.0
+        acc_grads = [tf.zeros_like(v) for v in variables]
+        debug_records: List[dict] = []
+        baseline_arg = ema_baseline if bool(ema_initialized.numpy()) else None
+
+        for acc_i in range(profile.gradient_accumulation):
+            with tf.GradientTape() as tape:
+                if debug and acc_i == profile.gradient_accumulation - 1:
+                    out = sim.execute(
+                        rangen, debug=True, debug_max_examples=3,
+                        baseline_value=baseline_arg,
+                    )
+                    loss_diff, loss, dbg = out
+                    debug_records.extend(dbg)
+                else:
+                    loss_diff, loss = sim.execute(
+                        rangen, baseline_value=baseline_arg,
+                    )
+            grads = tape.gradient(loss_diff, variables)
+            grads = [g if g is not None else tf.zeros_like(v)
+                     for g, v in zip(grads, variables)]
+            grads = [tf.where(tf.math.is_finite(g), g, tf.zeros_like(g))
+                     for g in grads]
+            acc_loss += float(loss.numpy())
+            acc_grads = [a + g for a, g in zip(acc_grads, grads)]
+
+        acc_grads = [g / float(profile.gradient_accumulation) for g in acc_grads]
+        raw_norm = float(tf.linalg.global_norm(acc_grads).numpy())
+        clipped_grads, clipped_norm_t = tf.clip_by_global_norm(
+            acc_grads, profile.grad_clip_norm,
+        )
+        clipped_norm = float(clipped_norm_t.numpy())
+        optimizer.apply_gradients(zip(clipped_grads, variables))
+
+        avg_loss = acc_loss / profile.gradient_accumulation
+        avg_loss_t = tf.cast(avg_loss, dtype_t)
+        if not bool(ema_initialized.numpy()):
+            ema_baseline.assign(avg_loss_t)
+            ema_initialized.assign(True)
+        else:
+            ema_baseline.assign(
+                ema_decay * ema_baseline + (1.0 - ema_decay) * avg_loss_t
+            )
+        return (avg_loss, raw_norm, clipped_norm, debug_records)
+
+    loss_history: List[float] = []
+    best_loss = float("inf")
+    best_ckpt_idx = 1
+
+    pbar = trange(profile.iterations, desc="Training", unit="step")
+    for j in pbar:
+        debug_now = ((j + 1) % profile.interval_save == 0)
+        step_loss, raw_norm, clipped_norm, dbg_records = single_step_eager(debug=debug_now)
+        loss_history.append(step_loss)
+        recent10 = float(np.mean(loss_history[max(0, j - 9): j + 1]))
+
+        try:
+            lr_val = float(lr_schedule(optimizer.iterations).numpy())
+        except Exception:
+            lr_val = float(optimizer.learning_rate.numpy())
+        pbar.set_postfix(
+            loss=f"{step_loss:+.4f}",
+            avg10=f"{recent10:+.4f}",
+            best=f"{best_loss:+.4f}",
+            lr=f"{lr_val:.1e}",
+            gn=f"{raw_norm:.1e}",
+        )
+
+        train_record = {
+            "iter": int(j + 1),
+            "loss": float(step_loss),
+            "avg10": float(recent10),
+            "best_window": float(best_loss) if np.isfinite(best_loss) else None,
+            "raw_grad_norm": float(raw_norm),
+            "clipped_grad_norm": float(clipped_norm),
+            "lr": float(lr_val),
+            "ema_baseline": float(ema_baseline.numpy()),
+            "advantage": float(step_loss - ema_baseline.numpy()),
+            "K": int(bank.K),
+            "max_q": float(tf.reduce_mean(tf.reduce_max(bank.mode_weights, axis=1)).numpy()),
+        }
+        _append_jsonl(train_debug_jsonl, [train_record])
+        if dbg_records:
+            for rec in dbg_records:
+                rec["train_iter"] = int(j + 1)
+            _append_jsonl(rollout_debug_jsonl, dbg_records)
+
+        if (j + 1) % profile.interval_save == 0:
+            ckpt_idx = (j + 1) // profile.interval_save
+            ckpt_path = ckpt_dir / f"{ckpt_idx}.weights.h5"
+            controller.save_weights(str(ckpt_path))
+            window_loss = float(np.mean(loss_history[max(0, j + 1 - profile.interval_save): j + 1]))
+            if window_loss < best_loss:
+                best_loss = window_loss
+                best_ckpt_idx = ckpt_idx
+
+    pbar.close()
+    print("[training] Done.")
+
+    best_path = ckpt_dir / f"{best_ckpt_idx}.weights.h5"
+    if best_path.exists():
+        controller.load_weights(str(best_path))
+        print(f"[ok] Loaded best checkpoint (idx={best_ckpt_idx}, "
+              f"window_loss={best_loss:+.4f})")
+
+    for f in ckpt_dir.glob("*.h5"):
+        f.unlink(missing_ok=True)
+    try:
+        ckpt_dir.rmdir()
+    except OSError:
+        pass
+
+    weights_path = out_dir / f"gravity_multi_pf_{profile.name}_final.weights.h5"
+    controller.save_weights(str(weights_path))
+    print(f"[ok] Saved final weights to {weights_path}")
+
+    _save_loss_history(out_dir, sim_str, loss_history, profile.interval_save)
+    _save_run_config(out_dir, profile=profile, cfg=cfg, bank_cfg=bank_cfg)
+    print(f"[done] All outputs saved to {out_dir.resolve()}")
+
+
+# ---------------------------------------------------------------------------
+# Evaluation
 # ---------------------------------------------------------------------------
 
 def run_evaluation(profile: RunProfile, weights_path: Optional[Path] = None) -> None:
-    """Load a trained controller and evaluate its performance.
-
-    Runs ``profile.eval_iters`` episodes with the trained controller and
-    prints the mean Holevo variance as a function of consumed resources.
-
-    Parameters
-    ----------
-    profile : RunProfile
-    weights_path : Path, optional
-        Path to the ``.weights.h5`` file.  Defaults to
-        ``{out_dir}/gravity_multi_pf_{name}_final.weights.h5``.
-    """
-    from typing import Optional  # re-import for type hints inside function
-
     out_dir = Path(profile.out_dir)
     if weights_path is None:
         weights_path = out_dir / f"gravity_multi_pf_{profile.name}_final.weights.h5"
-
     if not weights_path.exists():
         print(f"[warn] Weights not found at {weights_path}. Skipping evaluation.")
         return
 
     print(f"\n[eval] Loading weights from {weights_path}")
-    cfg = make_gravimeter_cfg()
+    cfg = make_gravimeter_cfg(profile)
     bank_cfg = make_bank_cfg(profile)
-    simpars = make_sim_pars(profile, cfg)
+    simpars = make_sim_pars(profile)
     rangen = tf.random.Generator.from_seed(profile.seed + 1000)
 
-    simulation, bank, controller = build_gravity_multi_pf_simulation(
+    sim, bank, controller = build_gravity_multi_pf_simulation(
         batchsize=profile.batchsize,
-        cfg=cfg,
-        bank_cfg=bank_cfg,
-        simpars=simpars,
-        rangen=rangen,
+        cfg=cfg, bank_cfg=bank_cfg, simpars=simpars, rangen=rangen,
     )
     controller.load_weights(str(weights_path))
-    print("[eval] Weights loaded.")
 
-    # Run evaluation episodes — collect V_H, MSE, true g, and estimated g
-    # All metrics are from the SAME episode (deploy mode) so they are paired.
-    all_vh = []       # Holevo variance per episode
-    all_mse = []      # MSE per episode (batch-averaged)
-    all_g_true = []   # true g values (bs,) per episode
-    all_g_hat = []    # posterior mean estimates (bs,) per episode
+    all_loss = []
+    all_mse = []
+    all_rmse = []
+    all_g_true = []
+    all_g_hat = []
 
     pbar = trange(profile.eval_iters, desc="Evaluating", unit="ep")
-    for i in pbar:
-        # Execute one episode in deploy mode to get true_values
-        result = simulation.execute(rangen, deploy=True)
-        true_values_tensor = result[0]  # (bs, 1, d)
-        g_true = true_values_tensor[:, 0, 0]  # (bs,)
+    for _ in pbar:
+        result = sim.execute(rangen, deploy=True)
+        true_values = result[0]
+        g_true = true_values[:, 0, 0]
 
-        # V_H from the bank after this episode (same episode!)
-        from math import pi as _pi
-        k_ref_fixed = tf.cast(
-            2.0 * _pi / max(simulation.g_hi - simulation.g_lo, 1e-10),
-            simulation.simpars.prec,
-        ) * tf.ones((profile.batchsize,), dtype=simulation.simpars.prec)
-        vh_tensor = bank.holevo_variance(k_ref_fixed)  # (bs, 1)
-        vh = float(tf.reduce_mean(vh_tensor).numpy())
-        all_vh.append(vh)
+        # log-Holevo at the END of the episode (coarsest scale only).
+        loss_b = sim._per_step_loss(controls=None)
+        all_loss.append(float(tf.reduce_mean(loss_b).numpy()))
 
-        # g_hat from MAP mode (highest-weight mode's mean, not mixture mean)
-        g_hat, _ = bank.map_mode_mean()  # (bs,)
-        mse_batch = float(tf.reduce_mean(tf.square(g_hat - g_true)).numpy())
-        all_mse.append(mse_batch)
+        # Point estimate from the highest-weight mode.
+        g_hat, _ = bank.map_mode_estimate()
+        sq = tf.square(g_hat - g_true)
+        mse_b = float(tf.reduce_mean(sq).numpy())
+        all_mse.append(mse_b)
+        all_rmse.append(float(np.sqrt(mse_b)))
         all_g_true.append(g_true.numpy())
         all_g_hat.append(g_hat.numpy())
-
         pbar.set_postfix(
-            V_H=f"{vh:.4f}",
-            RMSE=f"{np.sqrt(mse_batch):.2e}",
-            mean_VH=f"{np.mean(all_vh):.4f}",
+            loss=f"{all_loss[-1]:+.4f}",
+            rmse=f"{all_rmse[-1]:.2e}",
+            mean_loss=f"{np.mean(all_loss):+.4f}",
         )
     pbar.close()
 
-    all_vh = np.array(all_vh)
+    all_loss = np.array(all_loss)
     all_mse = np.array(all_mse)
-    all_rmse = np.sqrt(all_mse)
+    all_rmse = np.array(all_rmse)
     all_g_true_flat = np.concatenate(all_g_true)
     all_g_hat_flat = np.concatenate(all_g_hat)
 
     print(f"\n[eval] Results over {profile.eval_iters} episodes:")
-    print(f"  Mean V_H:  {np.mean(all_vh):.6f}")
-    print(f"  Mean MSE:  {np.mean(all_mse):.2e}")
-    print(f"  Mean RMSE: {np.mean(all_rmse):.2e} m/s²")
-    print(f"  Global RMSE (all samples): "
-          f"{np.sqrt(np.mean((all_g_true_flat - all_g_hat_flat)**2)):.2e} m/s²")
+    print(f"  Mean log-Holevo loss: {np.mean(all_loss):+.4f}")
+    print(f"  Mean MSE:             {np.mean(all_mse):.2e}")
+    print(f"  Mean RMSE:            {np.mean(all_rmse):.2e} m/s²")
+    rmse_global = float(np.sqrt(np.mean((all_g_true_flat - all_g_hat_flat) ** 2)))
+    print(f"  Global RMSE:          {rmse_global:.2e} m/s²")
 
-    # Save evaluation results — extended format
-    eval_path = out_dir / f"eval_{profile.name}.npy"
-    np.save(str(eval_path), all_vh)
-    print(f"[ok] Saved V_H to {eval_path}")
-
-    # Save extended eval data as npz
-    eval_ext_path = out_dir / f"eval_{profile.name}_extended.npz"
     np.savez(
-        str(eval_ext_path),
-        v_h=all_vh,
-        mse=all_mse,
-        rmse=all_rmse,
-        g_true=all_g_true_flat,
-        g_hat=all_g_hat_flat,
+        str(out_dir / f"eval_{profile.name}_extended.npz"),
+        loss=all_loss, mse=all_mse, rmse=all_rmse,
+        g_true=all_g_true_flat, g_hat=all_g_hat_flat,
     )
-    print(f"[ok] Saved extended eval (V_H, MSE, RMSE, g_true, g_hat) to {eval_ext_path}")
-
-
-# ---------------------------------------------------------------------------
-# Type annotation for Optional (used in run_evaluation)
-# ---------------------------------------------------------------------------
-
-from typing import Optional  # noqa: E402
+    print(f"[ok] Saved eval to {out_dir / f'eval_{profile.name}_extended.npz'}")
 
 
 # ---------------------------------------------------------------------------
@@ -979,21 +654,17 @@ from typing import Optional  # noqa: E402
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    """Entry point: select profile, set reproducibility, run training/eval."""
     profile = get_profile()
     set_global_reproducibility(profile.seed)
     tf.keras.backend.clear_session()
 
     if RUN_MODE in {"all", "train-only"}:
         run_training(profile)
-
     if RUN_MODE in {"all", "eval-only"}:
         run_evaluation(profile)
-
     if RUN_MODE not in {"all", "train-only", "eval-only"}:
         raise ValueError(
-            f"Unknown RUN_MODE={RUN_MODE!r}. "
-            "Choose 'all', 'train-only', or 'eval-only'."
+            f"Unknown RUN_MODE={RUN_MODE!r}. Choose 'all', 'train-only', or 'eval-only'."
         )
 
 
