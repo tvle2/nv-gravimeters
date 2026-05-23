@@ -131,7 +131,7 @@ class MultiPFBankConfig:
     resample_threshold: float = 0.5
     resample_alpha: float = 0.5
     resample_beta: float = 0.98
-    scibior_trick: bool = False
+    scibior_trick: bool = True
     trim: bool = True
 
 
@@ -406,15 +406,17 @@ class MultiPFBank:
         return tf.expand_dims(v_h, axis=1)
 
     def log_holevo_at_scale(self, k_ref: Tensor) -> Tensor:
-        """log(1 + V_H(k_ref)) = -log |mu(k_ref)|^2.  Bounded growth,
-        well-defined gradient.  Returns (B,).  This is the loss we
-        actually optimize at scale k_ref.
+        """log(1 + V_H(k_ref)) at the given scale.  Diagnostic / controller-input
+        only — NOT used in the training loss.  Floored at |mu|^2 = 1e-30 to keep
+        the value finite when the posterior is fully delocalized.
+        Returns shape (B,).
         """
         prec = self.prec
         re, im = self._complex_moment(k_ref)
         abs_mu_sq = tf.square(re) + tf.square(im)
-        # log(1/|mu|^2) = -log|mu|^2.  Clamp |mu|^2 from below for stability.
-        return -tf.math.log(tf.maximum(abs_mu_sq, tf.cast(1e-30, prec)))
+        v_h = 1.0 / tf.maximum(abs_mu_sq, tf.cast(1e-30, prec)) - 1.0
+        return tf.math.log1p(v_h)
+    
 
     def multi_scale_log_holevo_loss(self, scales: Tensor) -> Tensor:
         """Average log-Holevo across a list of scales (1D tensor of length J+1).
@@ -495,57 +497,93 @@ class GravityMultiPFSimulation(StatelessSimulation):
         dtype = tf.float32 if phys_model.prec == "float32" else tf.float64
         self._k_g_max: float = float(phys_model.max_gain(dtype).numpy())
 
-        # Loss design (Berry & Wiseman multi-scale Holevo, adapted):
-        # at every step the loss is computed at TWO scales:
-        #   (a) the COARSEST scale k_ref = 2pi / (g_hi - g_lo) — one fringe
-        #       spans the prior.  Penalizes failure to localize at all.
-        #   (b) the CURRENT measurement scale k_ref = k_g(controls) — one
-        #       fringe spans the controller's chosen aliasing distance.
-        #       Penalizes the controller for picking gains where the bank
-        #       still has unresolved fringes.
-        # We do NOT include the coarsest..finest dyadic ladder up to
-        # k_g_max, because the gradient through scales much finer than
-        # the current localization explodes (those scales contribute
-        # essentially noise but their gradients can be of order k_g_max
-        # times the coarse-scale gradient, which is ~10^4 here).
+        # Coarsest scale — used as a diagnostic feature for the controller input,
+        # NOT as the loss.  Fringe period = prior_width.
         prec = phys_model.prec
-        self._k_ref_coarsest: Tensor = tf.constant(
+        dtype = tf.float32 if prec == "float32" else tf.float64
+        self._k_ref_coarsest = tf.constant(
             2.0 * pi / max(self.g_hi - self.g_lo, 1e-30),
-            dtype=tf.float32 if prec == "float32" else tf.float64,
+            dtype=dtype,
         )
-        # Weight of the current-scale term in the per-step loss; the
-        # coarsest-scale term has weight 1.  alpha_meas = 0.5 makes the
-        # two terms comparable in magnitude when both posteriors are
-        # roughly delocalized.
-        self._alpha_meas: float = 0.5
 
     # ------------------------------------------------------------------
     # Per-step loss
     # ------------------------------------------------------------------
 
-    def _per_step_loss(self, controls: Optional[Tensor] = None) -> Tensor:
-        """Per-batch-element loss at the current bank state.
+    # def _per_step_loss(self, controls: Optional[Tensor] = None) -> Tensor:
+    #     """Per-batch-element loss at the current bank state.
 
-        L_b = log(1 + V_H(k_coarse)) + alpha * log(1 + V_H(k_meas))
-        where k_meas = k_g(controls) (or just the coarse term if controls
-        is None — used at episode start before any measurement).
+    #     L_b = log(1 + V_H(k_coarse)) + alpha * log(1 + V_H(k_meas))
+    #     where k_meas = k_g(controls) (or just the coarse term if controls
+    #     is None — used at episode start before any measurement).
 
-        Returns shape (B,).
+    #     Returns shape (B,).
+    #     """
+    #     bank = self.bank
+    #     prec = self.simpars.prec
+    #     coarse = bank.log_holevo_at_scale(self._k_ref_coarsest)
+    #     if controls is None:
+    #         return coarse
+    #     # k_g of THIS step's controls.  We stop_gradient to avoid double-counting
+    #     # the controls' gradient through the loss scale; the loss already
+    #     # depends on controls through the bank Bayes update.
+    #     k_meas = self.phys_model.k_g(controls[:, 0], controls[:, 1])
+    #     k_meas = tf.stop_gradient(k_meas)
+    #     meas = bank.log_holevo_at_scale(k_meas)
+    #     alpha = tf.cast(self._alpha_meas, prec)
+    #     return coarse + alpha * meas
+
+    # def _per_step_loss(self, controls: Optional[Tensor] = None) -> Tensor:
+    #     del controls   # loss scales are fixed; controller affects loss
+    #                 # only through the bank Bayes update.
+    #     return self.bank.multi_scale_log_holevo_loss(self._loss_scales)
+    # def _per_step_loss(self, controls: Optional[Tensor] = None) -> Tensor:
+    #     """Per-batch-element loss: bank mixture variance of g, in units of
+    #     (prior_width)^2.  This is the MSE-style loss Belliardo uses for
+    #     NV magnetometry, generalized to the multi-modal bank.
+
+    #     L_b = Var_q(g) / (g_hi - g_lo)^2  ∈ [0, 1/4]
+
+    #     Var_q(g) = E_q[g^2] - (E_q[g])^2
+    #             = Σ_k q_k (σ_k^2 + μ_k^2) - (Σ_k q_k μ_k)^2
+
+    #     Returns shape (B,).
+    #     """
+    #     del controls
+    #     prec = self.simpars.prec
+    #     g_mean, g_var = self.bank.marginal_mean_and_var()   # (B,), (B,)
+    #     norm = tf.cast((self.g_hi - self.g_lo) ** 2, prec)
+    #     return g_var / tf.maximum(norm, tf.cast(1e-30, prec))
+    def _per_step_loss(self, true_values: Tensor, controls: Optional[Tensor] = None) -> Tensor:
+        """Per-batch-element loss: squared error of the bank's posterior-mean
+        estimator, normalized by prior^2.
+
+        L_b = (E_q[g] - g_true_b)^2 / (g_hi - g_lo)^2
+
+        This is Belliardo Eq. 7 with the posterior mean as the point estimator,
+        which is the Bayes-optimal estimator under squared-error loss.  At step 0,
+        L_b varies across the batch (different g_true_b for each batch element),
+        giving the REINFORCE surrogate a nonzero advantage signal from the very
+        first measurement — unlike variance-of-posterior, where L_b is identical
+        across the batch at step 0 and the score term is zero.
+
+        Polynomial (quartic) in the bank weights, so Scibior-Wood is bias-free.
+
+        Parameters
+        ----------
+        true_values: Tensor
+            (B, 1, d) tensor of the per-episode true parameter values.  Only
+            the first parameter (g) is used.
+        controls: Tensor or None
+            Unused; kept for compatibility with the old signature.
         """
-        bank = self.bank
+        del controls
         prec = self.simpars.prec
-        coarse = bank.log_holevo_at_scale(self._k_ref_coarsest)
-        if controls is None:
-            return coarse
-        # k_g of THIS step's controls.  We stop_gradient to avoid double-counting
-        # the controls' gradient through the loss scale; the loss already
-        # depends on controls through the bank Bayes update.
-        k_meas = self.phys_model.k_g(controls[:, 0], controls[:, 1])
-        k_meas = tf.stop_gradient(k_meas)
-        meas = bank.log_holevo_at_scale(k_meas)
-        alpha = tf.cast(self._alpha_meas, prec)
-        return coarse + alpha * meas
-
+        g_mean, _ = self.bank.marginal_mean_and_var()         # (B,)
+        g_true = true_values[:, 0, 0]                         # (B,)
+        norm = tf.cast((self.g_hi - self.g_lo) ** 2, prec)
+        err = g_mean - g_true                                 # (B,)
+        return tf.square(err) / tf.maximum(norm, tf.cast(1e-30, prec))
     # ------------------------------------------------------------------
     # Controller input
     # ------------------------------------------------------------------
@@ -628,17 +666,28 @@ class GravityMultiPFSimulation(StatelessSimulation):
     # Loss
     # ------------------------------------------------------------------
 
+    # def loss_function(
+    #     self,
+    #     weights: Tensor, particles: Tensor,
+    #     true_values: Tensor, used_resources: Tensor, meas_step: Tensor,
+    # ) -> Tensor:
+    #     """Per-step loss without controls reference (coarsest scale only).
+    #     The full per-step loss with the current-scale term is computed
+    #     inside execute() where controls are available.  Returns (B, 1).
+    #     """
+    #     del weights, particles, true_values, used_resources, meas_step
+    #     return tf.expand_dims(self._per_step_loss(controls=None), axis=1)
     def loss_function(
         self,
         weights: Tensor, particles: Tensor,
         true_values: Tensor, used_resources: Tensor, meas_step: Tensor,
     ) -> Tensor:
-        """Per-step loss without controls reference (coarsest scale only).
-        The full per-step loss with the current-scale term is computed
-        inside execute() where controls are available.  Returns (B, 1).
-        """
-        del weights, particles, true_values, used_resources, meas_step
-        return tf.expand_dims(self._per_step_loss(controls=None), axis=1)
+        """Bayes-optimal-estimator squared error.  Returns (B, 1)."""
+        del weights, particles, used_resources, meas_step
+        return tf.expand_dims(
+            self._per_step_loss(true_values=true_values, controls=None),
+            axis=1,
+        )
 
     # ------------------------------------------------------------------
     # Debug snapshot
@@ -656,7 +705,9 @@ class GravityMultiPFSimulation(StatelessSimulation):
 
         g_mix, g_var = bank.marginal_mean_and_var()
         g_map, g_std_map = bank.map_mode_estimate()
-        l_per_b = self._per_step_loss(controls=controls)
+        l_per_b = self._per_step_loss(
+            true_values=true_values, controls=controls,
+        )
         v_h_coarsest = bank.holevo_variance(self._k_ref_coarsest)[:, 0]
         k_g = self.phys_model.k_g(controls[:, 0], controls[:, 1])
         v_h_meas = bank.holevo_variance(k_g)[:, 0]
@@ -816,6 +867,31 @@ class GravityMultiPFSimulation(StatelessSimulation):
                     continue_flag, sum_log_prob + log_prob, sum_log_prob,
                 )
 
+            # # 6. Bank Bayes update (mode + within-mode), respects continue_flag.
+            # bank.apply_measurement(
+            #     outcomes=outcomes,
+            #     controls=controls,
+            #     meas_step=meas_step,
+            #     continue_flag=continue_flag,
+            #     rangen=rangen,
+            # )
+
+            # # If the user has requested stop_gradient_pf, sever the
+            # # gradient through the bank state at this step.  Combined
+            # # with stop_gradient_input, this gives a fully greedy
+            # # optimization analogous to optbayesexpt (Belliardo Sec D.4).
+            # if pars.stop_gradient_pf:
+            #     bank.mode_weights = tf.stop_gradient(bank.mode_weights)
+            #     bank.weights_list = [tf.stop_gradient(w) for w in bank.weights_list]
+            #     bank.particles_list = [tf.stop_gradient(p) for p in bank.particles_list]
+
+            # weights = bank.weights_list[0]
+            # particles = bank.particles_list[0]
+            # self.pf.np = bank.pf_list[0].np  # keep parent in sync
+
+            # # 7. Per-step loss.  Two-scale log-Holevo: coarsest + current k_g.
+            # L_step_b = self._per_step_loss(controls=controls)
+
             # 6. Bank Bayes update (mode + within-mode), respects continue_flag.
             bank.apply_measurement(
                 outcomes=outcomes,
@@ -824,22 +900,24 @@ class GravityMultiPFSimulation(StatelessSimulation):
                 continue_flag=continue_flag,
                 rangen=rangen,
             )
-
-            # If the user has requested stop_gradient_pf, sever the
-            # gradient through the bank state at this step.  Combined
-            # with stop_gradient_input, this gives a fully greedy
-            # optimization analogous to optbayesexpt (Belliardo Sec D.4).
-            if pars.stop_gradient_pf:
-                bank.mode_weights = tf.stop_gradient(bank.mode_weights)
-                bank.weights_list = [tf.stop_gradient(w) for w in bank.weights_list]
-                bank.particles_list = [tf.stop_gradient(p) for p in bank.particles_list]
-
             weights = bank.weights_list[0]
             particles = bank.particles_list[0]
             self.pf.np = bank.pf_list[0].np  # keep parent in sync
 
-            # 7. Per-step loss.  Two-scale log-Holevo: coarsest + current k_g.
-            L_step_b = self._per_step_loss(controls=controls)
+            # 7. Per-step loss — computed BEFORE detaching, so dL/dcontrols_t is live.
+            L_step_b = self._per_step_loss(
+                true_values=true_values, controls=controls,
+            )
+
+            # 8. NOW detach for the NEXT step (1-step BPTT, paper-mode).
+            #    This matches Belliardo's simulation.py lines 416-433: the
+            #    stop_gradient is applied to the INPUTS of the NEXT step's
+            #    apply_measurement, not to the bank state used in the current
+            #    step's loss.
+            if pars.stop_gradient_pf:
+                bank.mode_weights   = tf.stop_gradient(bank.mode_weights)
+                bank.weights_list   = [tf.stop_gradient(w) for w in bank.weights_list]
+                bank.particles_list = [tf.stop_gradient(p) for p in bank.particles_list]
 
             # Debug
             if debug:
@@ -862,78 +940,28 @@ class GravityMultiPFSimulation(StatelessSimulation):
             if not deploy:
                 active = tf.cast(continue_flag[:, 0], prec)             # (B,)
                 n_active = tf.maximum(tf.reduce_sum(active), tf.cast(1.0, prec))
-                # Mean over active batch elements of L_step_b.
                 mean_L_step = tf.reduce_sum(L_step_b * active) / n_active
-                # log E[L] = log of the batch mean (Belliardo 2024 Eq. 109).
-                # Floor to avoid log(0) when posterior collapses to a delta.
-                log_step = tf.math.log(tf.maximum(mean_L_step, tf.cast(1e-30, prec)))
-                loss_acc = loss_acc + log_step
+                loss_acc = loss_acc + mean_L_step                  # NO log
 
-                # REINFORCE surrogate.  d log E[L] / dlambda
-                #     = (1/E[L]) * E[(L - B) * d log p_relevant / dlambda  +  dL/dlambda]
-                # We construct a surrogate whose gradient equals the RHS:
-                #     surrogate_t = log E[L]
-                #                 + (1/sg(E[L])) * mean_b{ sg(L_b - B) * logp_relevant }
-                # The first term provides dL/dlambda (path-derivative through
-                # the bank).  The second term provides the score-function
-                # correction (REINFORCE).
-                #
-                # Which "logp_relevant" to use:
-                #   * stop_gradient_pf=False (full BPTT):  the loss at step t
-                #     depends on every prior step's controls through the bank
-                #     state, so the relevant log-prob is the CUMULATIVE
-                #     sum_log_prob across all steps so far.
-                #   * stop_gradient_pf=True  (1-step BPTT, greedy / paper-mode):
-                #     the loss at step t depends ONLY on step t's controls.
-                #     The relevant log-prob is the per-step log_prob — using
-                #     the cumulative sum here would attribute step t's outcome
-                #     randomness to controls of steps t' < t that no longer
-                #     affect L_t, biasing the gradient with noise.
                 if pars.loss_logl_outcomes:
                     if baseline_value is not None:
-                        baseline_step = tf.cast(baseline_value, prec)
+                        added = tf.cast(baseline_value, prec)
                     elif pars.baseline:
-                        baseline_step = mean_L_step  # per-batch mean
+                        added = mean_L_step
                     else:
-                        baseline_step = tf.zeros((), dtype=prec)
-                    advantage = L_step_b - baseline_step                  # (B,)
-                    ####################
-                    # if pars.stop_gradient_pf:
-                    #     # Per-step log_prob (gated by continue_flag).
-                    #     logp_for_score = tf.where(
-                    #         continue_flag[:, 0],
-                    #         log_prob[:, 0],
-                    #         tf.zeros((self.bs,), dtype=prec),
-                    #     )
-                    # else:
-                    #     # Cumulative log_prob across all prior steps.
-                    #     logp_for_score = sum_log_prob[:, 0]
-                    ######################
-                    # REINFORCE score-function term: must be the CUMULATIVE
-                    # sum of log p(y_t | controls_t, theta) across all steps
-                    # in this trajectory, regardless of stop_gradient_pf.
-                    # Rationale (Belliardo 2024 SI App. D.3, Eq. 87-91):
-                    # the score function arises from differentiating
-                    #   p(trajectory) = prod_t p(y_t | controls_t, theta)
-                    # so its log is sum_t log p(y_t | ...).  Even when we
-                    # detach the bank gradient at every step, the trajectory
-                    # itself was sampled with all prior controls, and REINFORCE
-                    # attributes each outcome's randomness to whichever
-                    # controls produced it.  Using only the per-step term
-                    # drops legitimate gradient contributions and biases
-                    # the optimizer toward myopic behavior.
-                    logp_for_score = sum_log_prob[:, 0]
-                    inv_meanL = 1.0 / tf.stop_gradient(
-                        tf.maximum(mean_L_step, tf.cast(1e-30, prec))
+                        added = tf.zeros((), dtype=prec)
+
+                    # Belliardo simulation.py lines 214-222 (cumulative, NOT log_loss):
+                    # loss_diff_partial = mean_b{L_b + (sg(L_b) - added) * sum_log_prob_b}
+                    per_batch_surrogate = (
+                        L_step_b
+                        + (tf.stop_gradient(L_step_b) - added) * sum_log_prob[:, 0]
                     )
-                    score_term = inv_meanL * (
-                        tf.reduce_sum(
-                            tf.stop_gradient(advantage) * logp_for_score * active
-                        ) / n_active
-                    )
-                    loss_diff_acc = loss_diff_acc + log_step + score_term
+                    per_batch_surrogate = per_batch_surrogate * active
+                    mean_surrogate = tf.reduce_sum(per_batch_surrogate) / n_active
+                    loss_diff_acc = loss_diff_acc + mean_surrogate
                 else:
-                    loss_diff_acc = loss_diff_acc + log_step
+                    loss_diff_acc = loss_diff_acc + mean_L_step
 
             if deploy:
                 hist_inputs.append(input_strategy)
@@ -946,8 +974,8 @@ class GravityMultiPFSimulation(StatelessSimulation):
         # --- Normalize and return ---
         if not deploy:
             denom = tf.cast(max(step_count, 1), prec)
-            loss_diff_final = loss_diff_acc / denom
-            loss_final = loss_acc / denom
+            loss_diff_final = loss_diff_acc / denom    # cumulative variance / T
+            loss_final = loss_acc / denom              # reported same
             if debug:
                 return loss_diff_final, loss_final, debug_records
             return loss_diff_final, loss_final

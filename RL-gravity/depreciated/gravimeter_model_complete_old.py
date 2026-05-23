@@ -1,8 +1,6 @@
 # gravimeter_model_complete.py
 """Physical model for the spin-optomechanical gravimeter.
 
-REVISED for the Gaussian-mixture bank pipeline.
-
 Implements the readout model from
   Wang et al., "Enhanced Gravity Sensing by a Levitated Mesoscopic
   Nanoparticle", Phys. Rev. Lett. 135, 120803 (2025),
@@ -10,44 +8,11 @@ plugged into the StatelessPhysicalModel API of qsensoropt
   (Belliardo et al., Phys. Rev. A 109, 062609 (2024)).
 
 Single-shot readout probability:
-    P(+1 | g, x) = 1/2 (1 + A · cos(k_g · g + φ_total))
-    φ_total = phi_off + phi_MW
-    k_g(T, B') = (2 γ_e B' / ω) · T²  +  (8π γ_e B' / ω³)
-
-A is the visibility (1 in the no-noise mode; reduced by trap noise and
-the spin coherence time T2_spin_s in 'paper' mode).
-
-Compatibility with the GM bank
-------------------------------
-The Gaussian-mixture bank (`GaussianMixtureBank`) requires:
-
-  * `phys_model.k_g(T, B')`              with T, B' of shape (B,)
-  * `phys_model.known_visibility_factor(T, B')`  with shape (B,)
-  * `phys_model.cfg.fixed_phi_off_rad`   (a float, used when
-    `infer_phi_off=False`)
-
-All three are implemented below. The GM bank currently supports
-**single-parameter** estimation of g; if `infer_phi_off=True`, the
-bank will silently *use* the fixed phi_off_rad and the controller will
-need to learn around the offset — which is wasteful but not incorrect.
-For joint (g, phi_off) inference, extend `GaussianMixtureBank` to a
-2-D Gaussian mixture (component covariances become 2×2).
-
-CHANGELOG vs. original
-----------------------
-[BUG-FIX] k_g second term was missing a factor of hbar in an earlier
-  draft.  Term is ~10^-36 of the leading T² term at typical parameters,
-  so the bug had no observable effect, but it's now physically correct.
-
-[NEW] Default T2_spin_s = 1 ms (conservative pre-DD, room-temp).
-
-[NEW] perform_measurement returns log_prob of shape (B, 1) (was (B,
-  1, 1)) to match what GravityGMSimulation expects.  Validated by
-  inspection of the existing code path: only the (B, 1) slice was
-  being used in the surrogate-loss accumulation.
-
-[ANNOTATION] Added a `validate_for_gm_bank()` method that raises a
-  clear error if the config is incompatible with the GM bank.
+    P(+1 | g, x) = 1/2 (1 + A * cos(theta))
+    theta = k_g(T, B') * g + phi_off + phi_MW
+    k_g(T, B') = 2 gamma_e B' / omega * T^2  +  8*pi*gamma_e B' / omega^3
+A is the visibility (1 in the no-noise mode; reduced by trap noise / T2 spin
+decoherence in 'paper' mode).
 """
 from __future__ import annotations
 
@@ -65,7 +30,7 @@ from tensorflow import Tensor
 
 
 # ---------------------------------------------------------------------------
-# qsensoropt loader
+# qsensoropt loader (handles either installed package or local .py files)
 # ---------------------------------------------------------------------------
 
 def _load_local_qsensoropt_module(module_name: str):
@@ -107,14 +72,25 @@ except Exception:
 # ---------------------------------------------------------------------------
 
 def safe_clip_prob(x: Tensor, eps: Optional[float] = None) -> Tensor:
+    """Clip a probability into [eps, 1-eps] with a dtype-aware default eps.
+
+    The default eps is chosen so that ``1 - eps`` is representably distinct
+    from 1.0 in the tensor's dtype.  Using eps=1e-9 in float32 is broken
+    because 1 - 1e-9 rounds to 1.0 exactly, defeating the clip.
+    """
     if eps is None:
-        eps = 1e-7 if x.dtype == tf.float32 else 1e-12
+        # ~10x machine epsilon for the dtype.
+        if x.dtype == tf.float32:
+            eps = 1e-7
+        else:
+            eps = 1e-12
     eps_t = tf.cast(eps, x.dtype)
     one_t = tf.cast(1.0, x.dtype)
     return tf.clip_by_value(x, eps_t, one_t - eps_t)
 
 
 def wrap_to_pi_tf(x: Tensor) -> Tensor:
+    """Wrap an angle to (-pi, pi]."""
     two_pi = tf.cast(2.0 * pi, x.dtype)
     return tf.math.floormod(x + tf.cast(pi, x.dtype), two_pi) - tf.cast(pi, x.dtype)
 
@@ -132,14 +108,14 @@ class GravimeterConfig:
     gamma_e_rad_s_T: float = 2.0 * pi * 28e9
     mass_kg: float = 1.47e-17
     hbar_J_s: float = 1.054_571_817e-34
-    kT_to_T: float = 1e3
+    kT_to_T: float = 1e3  # 1 kT/m = 1e3 T/m
 
     # Estimation prior
     g_range: tuple[float, float] = (9.7806, 9.825)
     infer_mfg_bias: bool = False
     beta_B_range: tuple[float, float] = (-0.10, 0.10)
 
-    infer_phi_off: bool = False  # GM bank assumes False
+    infer_phi_off: bool = True
     phi_off_range_rad: tuple[float, float] = (-pi, pi)
     fixed_phi_off_rad: float = 0.0
 
@@ -147,27 +123,27 @@ class GravimeterConfig:
     T_range_s: tuple[float, float] = (10e-6, 1.2e-3)
     Bp_range_kTm: tuple[float, float] = (0.5, 80.0)
 
-    # MFG-magnitude noise
+    # MFG-magnitude noise (relative, uniform on [-bound, +bound])
     mfg_rel_noise_bound: float = 0.0
     mfg_noise_quad_points: int = 1
     sigma_omega_rel: float = 0.0
-    trap_visibility_mode: str = "none"
+    trap_visibility_mode: str = "none"  # "none" | "small_noise_avg" | "exact_single_delta"
     trap_noise_quad_points: int = 9
 
+    # Fixed (un-inferred) MFG bias (relative)
     fixed_mfg_rel_bias: float = 0.0
     apply_fixed_mfg_bias_in_model: bool = True
 
     # Spin decoherence
-    T2_spin_s: Optional[float] = 1.0e-3
+    T2_spin_s: Optional[float] = None
     readout_flip_prob: float = 0.0
 
     # Resource-counting
     dead_time_s: float = 0.0
-    mfg_resource_cost_s_at_ref_s: float = 0.0  # legacy alias preserved
     mfg_resource_cost_s_at_ref: float = 0.0
     mfg_resource_ref_kTm: float = 50.0
 
-    prec: str = "float64"
+    prec: str = "float32"
 
     @property
     def tau_s(self) -> float:
@@ -179,7 +155,14 @@ class GravimeterConfig:
 # ---------------------------------------------------------------------------
 
 class GravityStatelessPhysicalModel(StatelessPhysicalModel):
-    """Stateless physical-model wrapper for the levitated-NV gravimeter."""
+    """Stateless physical-model wrapper for the levitated-NV gravimeter.
+
+    The unknown parameters are (g, optional beta_B, optional phi_off).
+    Controls are (T_s, Bp_kTm, mw_phase_rad).
+    The single-shot outcome y in {0, 1} has probability
+        P(y=1 | g, x) = 1/2 (1 + A * cos(k_g g + phi_off + mw_phase))
+    where A is the visibility, possibly attenuated by trap noise / spin T2.
+    """
 
     def __init__(self, batchsize: int, cfg: GravimeterConfig) -> None:
         self.cfg = cfg
@@ -194,30 +177,9 @@ class GravityStatelessPhysicalModel(StatelessPhysicalModel):
         if cfg.infer_phi_off:
             params.append(Parameter(bounds=cfg.phi_off_range_rad, name="phi_off"))
         super().__init__(
-            batchsize=batchsize,
-            controls=controls,
-            params=params,
-            outcomes_size=1,
-            prec=cfg.prec,
+            batchsize=batchsize, controls=controls, params=params,
+            outcomes_size=1, prec=cfg.prec,
         )
-
-    # ---- Validation hook used by the GM bank pipeline ----------------------
-
-    def validate_for_gm_bank(self) -> None:
-        """Raise if the model config can't be used with the
-        Gaussian-mixture bank (which only models p(g | y))."""
-        if self.cfg.infer_mfg_bias:
-            raise ValueError(
-                "infer_mfg_bias=True is incompatible with the 1D "
-                "Gaussian-mixture bank. Either set infer_mfg_bias=False "
-                "or extend GaussianMixtureBank to a 2D mixture."
-            )
-        if self.cfg.infer_phi_off:
-            raise ValueError(
-                "infer_phi_off=True is incompatible with the 1D "
-                "Gaussian-mixture bank. Use a fixed phi_off and let the "
-                "controller learn the MW phase."
-            )
 
     # ---- Parameter helpers ------------------------------------------------
 
@@ -255,19 +217,15 @@ class GravityStatelessPhysicalModel(StatelessPhysicalModel):
         )
 
     def k_g(self, T_s: Tensor, Bp_kTm: Tensor) -> Tensor:
-        """d(theta)/dg from Wang Eq. (3).
-
-        Δφ = (2 η / y0) g T² + 16 π η_g η
-        d Δφ / dg = (2 γ_e B' / ω) T² + (8 π γ_e B' ℏ / ω³)
-
-        The second term is ~10⁻³⁷ smaller than the first and is
-        dropped for clarity.
-        """
+        """d(theta)/dg.  See Wang et al. Eq. (3) and SI."""
         cfg = self.cfg
         Bp_T_per_m = Bp_kTm * tf.cast(cfg.kT_to_T, T_s.dtype)
         w = tf.cast(cfg.omega_rad_s, T_s.dtype)
         ge = tf.cast(cfg.gamma_e_rad_s_T, T_s.dtype)
-        return (2.0 * ge / w) * Bp_T_per_m * tf.square(T_s)
+        return (
+            (2.0 * ge / w) * Bp_T_per_m * tf.square(T_s)
+            + (8.0 * tf.cast(pi, T_s.dtype) * ge / (w ** 3)) * Bp_T_per_m
+        )
 
     def min_gain(self, dtype) -> Tensor:
         return self.k_g(
@@ -311,8 +269,10 @@ class GravityStatelessPhysicalModel(StatelessPhysicalModel):
     ) -> Tensor:
         cfg = self.cfg
         eta = self.eta(Bp_kTm)
-        # Wang SI Eq. S60: ω·δt ≈ -2π·δω/ω → x := ω·δt
-        x = -tf.cast(cfg.tau_s, eta.dtype) * delta_omega_rad_s
+        tau = tf.cast(cfg.tau_s, eta.dtype)
+        x = tf.cast(cfg.omega_rad_s, eta.dtype) * (
+            -tau * delta_omega_rad_s / tf.cast(cfg.omega_rad_s, eta.dtype)
+        )
         amp = 16.0 * eta * tf.cos(x / 4.0) * tf.square(tf.sin(3.0 * x / 4.0))
         return tf.exp(-0.5 * tf.square(amp))
 
@@ -362,7 +322,7 @@ class GravityStatelessPhysicalModel(StatelessPhysicalModel):
             vis = vis * tf.exp(-self.cycle_time_s(T_s) / tf.cast(cfg.T2_spin_s, vis.dtype))
         return tf.clip_by_value(vis, 0.0, 1.0)
 
-    # ---- MFG-bias quadrature ----------------------------------------------
+    # ---- MFG-bias quadrature for likelihood -------------------------------
 
     def mfg_quadrature(self, dtype) -> Tuple[Tensor, Tensor]:
         bound = float(self.cfg.mfg_rel_noise_bound)
@@ -399,7 +359,7 @@ class GravityStatelessPhysicalModel(StatelessPhysicalModel):
             return 1.0 + beta_B
         return tf.cast(1.0 + cfg.fixed_mfg_rel_bias, beta_B.dtype)
 
-    # ---- Likelihood -------------------------------------------------------
+    # ---- Likelihood (called by the bank) ----------------------------------
 
     def likelihood_given_global_params(
         self, outcomes: Tensor, controls: Tensor,
@@ -464,11 +424,11 @@ class GravityStatelessPhysicalModel(StatelessPhysicalModel):
             p_plus = safe_clip_prob((1.0 - flip) * p_plus + flip * (1.0 - p_plus))
         u = rangen.uniform(shape=tf.shape(p_plus), minval=0.0, maxval=1.0, dtype=p_plus.dtype)
         y = tf.cast(u < p_plus, p_plus.dtype)
-        outcomes = tf.expand_dims(tf.expand_dims(y, axis=1), axis=2)  # (B, 1, 1)
+        outcomes = tf.expand_dims(tf.expand_dims(y, axis=1), axis=2)
         log_prob = tf.expand_dims(
             tf.math.log(tf.where(y > 0.5, p_plus, 1.0 - p_plus)),
             axis=1,
-        )  # (B, 1)
+        )
         return outcomes, log_prob
 
     # ---- Resource counting ------------------------------------------------

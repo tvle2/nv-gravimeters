@@ -9,3 +9,4 @@ RL-gravity/runs
 RL-gravity/lib64
 RL-gravity/pyvenv.cfg
 __pycache__/
+/RL-gravity/runs/gravity_gm_diag/rollout_debug.jsonl

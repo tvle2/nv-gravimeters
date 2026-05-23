@@ -166,31 +166,30 @@ SMOKE_PROFILE = RunProfile(
     eval_iters=8,
 )
 
-# Pilot: a real (small) training run.  ~1h on a single GPU, ~5–10h on CPU.
 PILOT_PROFILE = RunProfile(
     name="pilot",
-    out_dir="runs/gravity_multi_pf_pilot",
+    out_dir="runs/gravity_multi_pf_pilot_fast",
     batchsize=32,
-    iterations=2000,
+    iterations=200,
     interval_save=100,
     max_steps=32,
-    max_resources=10.0,           # effectively no resource cap
-    initial_lr=1e-3,
-    grad_clip_norm=1.0,
+    max_resources=10.0,
+    initial_lr=3e-3,
+    grad_clip_norm=100.0,
     seed=42,
-    gradient_accumulation=1,
+    gradient_accumulation=2,
 
     n_per_mode=64,
     k_max=128,
 
-    top_k_modes=4,
+    top_k_modes=16,
     prec="float64",
 
     cumulative_loss=True,
     baseline=True,
     loss_logl_outcomes=True,
     stop_gradient_input=True,
-    stop_gradient_pf=True,
+    stop_gradient_pf=False,
 
     eval_iters=64,
 )
@@ -315,7 +314,7 @@ def make_bank_cfg(profile: RunProfile) -> MultiPFBankConfig:
         resample_threshold=0.5,
         resample_alpha=0.5,
         resample_beta=0.98,
-        scibior_trick=False,            # disabled: loss is non-polynomial in weights
+        scibior_trick=True,
         trim=True,
     )
 
@@ -609,8 +608,7 @@ def run_evaluation(profile: RunProfile, weights_path: Optional[Path] = None) -> 
         true_values = result[0]
         g_true = true_values[:, 0, 0]
 
-        # log-Holevo at the END of the episode (coarsest scale only).
-        loss_b = sim._per_step_loss(controls=None)
+        loss_b = sim._per_step_loss(true_values=true_values, controls=None)
         all_loss.append(float(tf.reduce_mean(loss_b).numpy()))
 
         # Point estimate from the highest-weight mode.
@@ -635,7 +633,7 @@ def run_evaluation(profile: RunProfile, weights_path: Optional[Path] = None) -> 
     all_g_hat_flat = np.concatenate(all_g_hat)
 
     print(f"\n[eval] Results over {profile.eval_iters} episodes:")
-    print(f"  Mean log-Holevo loss: {np.mean(all_loss):+.4f}")
+    print(f"  Mean MSE loss (normalized): {np.mean(all_loss):+.4f}")
     print(f"  Mean MSE:             {np.mean(all_mse):.2e}")
     print(f"  Mean RMSE:            {np.mean(all_rmse):.2e} m/s²")
     rmse_global = float(np.sqrt(np.mean((all_g_true_flat - all_g_hat_flat) ** 2)))
