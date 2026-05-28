@@ -157,6 +157,22 @@ class ControlScheduleLayer(tf.keras.layers.Layer):
         # so at fixed B', k_g varies with T². And at fixed T, k_g ∝ B'.
         # We expose a feasible log-uniform k_g_target ∈ [k_g_min, k_g_max].
 
+        ##########################
+        # # Bring in hbar
+        # hbar = tf.cast(phys_model.cfg.hbar_J_s, self._dtype)
+        # const_term = 8.0 * pi * self._gamma * hbar / tf.pow(self._omega, 3)
+
+        # k_g_min_raw = (
+        #     2.0 * self._gamma / self._omega
+        #     * (self._Bp_min * self._kT) * tf.square(self._T_min)
+        #     + const_term * (self._Bp_min * self._kT)
+        # )
+        # k_g_max_raw = (
+        #     2.0 * self._gamma / self._omega
+        #     * (self._Bp_max * self._kT) * tf.square(self._T_max)
+        #     + const_term * (self._Bp_max * self._kT)
+        # )
+        ##########################
         k_g_min_raw = (
             2.0 * self._gamma / self._omega
             * (self._Bp_min * self._kT) * tf.square(self._T_min)
@@ -171,7 +187,16 @@ class ControlScheduleLayer(tf.keras.layers.Layer):
             self._dtype,
         )
         self._k_g_min = tf.maximum(k_g_min_raw, k_g_floor)
-
+        self._K_cast = tf.constant(float(K), dtype=self._dtype)
+        # Physics-defined inter-mode discrimination optimum:
+        # k_g_inter_opt = π * K / Δg
+        # At this k_g, two adjacent modes give maximally distinguishable outcomes.
+        self._k_g_inter_opt = (
+            tf.cast(pi, self._dtype) * self._K_cast / self._g_range
+        )
+        self._log_k_g_inter_opt = (
+            tf.math.log(self._k_g_inter_opt) / tf.cast(np.log(10.0), self._dtype)
+        )
         # Hard prior-aliasing cap: at k_g > π/Δg the cosine readout has more than
         # half a fringe across the prior, so modes on different fringes are aliased
         # (same Z up to damp differences). Independent of K — the prior width is
@@ -216,28 +241,43 @@ class ControlScheduleLayer(tf.keras.layers.Layer):
         sigma_g = sigma_frac * self._g_range
         sigma_g = tf.maximum(sigma_g, tf.cast(1e-30, self._dtype))
 
-        # V8 posterior-adaptive cap: k_g_cap = π / σ_marginal.
-        # sigma_g (computed above from mix_log_std_norm) already IS the marginal
-        # posterior std. At init: σ_marginal ≈ Δg/√12 ≈ 0.013 → cap ≈ 245.
-        # As bank localises: σ_marginal shrinks → cap auto-grows.
-        # No threshold, no chicken-and-egg, no unimodality logic.
-        #
-        # Factor of π (not 2π) ensures the cosine fringe spacing 2π/k_g covers
-        # at least 2·σ_marginal on each side of the bank's centre of mass — i.e.
-        # the readout is unambiguous across the bulk of the current posterior.
+        # # V8 posterior-adaptive cap: k_g_cap = π / σ_marginal.
+        # # sigma_g (computed above from mix_log_std_norm) already IS the marginal
+        # # posterior std. At init: σ_marginal ≈ Δg/√12 ≈ 0.013 → cap ≈ 245.
+        # # As bank localises: σ_marginal shrinks → cap auto-grows.
+        # # No threshold, no chicken-and-egg, no unimodality logic.
+        # #
+        # # Factor of π (not 2π) ensures the cosine fringe spacing 2π/k_g covers
+        # # at least 2·σ_marginal on each side of the bank's centre of mass — i.e.
+        # # the readout is unambiguous across the bulk of the current posterior.
         k_post_cap = tf.cast(pi, self._dtype) / sigma_g
 
         # Bound by hardware max and the alias-safe floor.
         eff_k_g_max = tf.minimum(k_post_cap, self._k_g_hw_max)
         eff_k_g_max = tf.maximum(eff_k_g_max, self._k_g_min)
-
         log_eff_max = tf.math.log(eff_k_g_max) / tf.cast(np.log(10.0), self._dtype)
+        log_k_g_min = self._log_k_g_min
 
-        # u_kg ∈ [-1, 1] → log10(k_g_target) ∈ [log_k_g_min, log_eff_max]
-        log_kg_target = self._log_k_g_min + (
+        # Physics-centered mapping:
+        # At u_kg = 0, k_g = min(πK/Δg, eff_k_g_max) — physics optimum subject to feasibility
+        # At u_kg = -1, k_g = k_g_min (coarsest hardware-allowed)
+        # At u_kg = +1, k_g = eff_k_g_max (finest σ-allowed)
+        # Piecewise-linear in log space, asymmetric to respect both bounds.
+        # log_center = tf.minimum(self._log_k_g_inter_opt, log_eff_max)
+        # log_range_neg = log_center - log_k_g_min        # half-range below center
+        # log_range_pos = log_eff_max - log_center        # half-range above center
+
+        # log_kg_target = log_center + tf.where(
+        #     u_kg < tf.cast(0.0, self._dtype),
+        #     u_kg * log_range_neg,
+        #     u_kg * log_range_pos,
+        # )
+
+        log_kg_target = log_k_g_min + (
             (u_kg + tf.cast(1.0, self._dtype)) * tf.cast(0.5, self._dtype)
-        ) * (log_eff_max - self._log_k_g_min)
+        ) * (log_eff_max - log_k_g_min)
         k_g_target = tf.pow(tf.cast(10.0, self._dtype), log_kg_target)
+        
 
         # Solve for (T, B') given k_g_target. We pick B' first in its
         # feasible interval determined by T ∈ [T_min, T_max], then back
@@ -260,7 +300,17 @@ class ControlScheduleLayer(tf.keras.layers.Layer):
         Bp = Bp_low + (
             (u_B + tf.cast(1.0, self._dtype)) * tf.cast(0.5, self._dtype)
         ) * (Bp_high - Bp_low)
-
+        ####################
+        # Bp_T = Bp * self._kT
+        # a = tf.cast(2.0, self._dtype) * self._gamma / self._omega * Bp_T
+        # # Wang Eq. (3) second term with ℏ — ~10⁻³⁴ smaller than the leading T²-scaled term.
+        # hbar = tf.cast(self._cfg.hbar_J_s, self._dtype)
+        # b_const = (
+        #     8.0 * tf.cast(pi, self._dtype) * self._gamma * hbar
+        #     / tf.pow(self._omega, 3) * Bp_T
+        # )
+        # T_sq = (k_g_target - b_const) / tf.maximum(a, tf.cast(1e-30, self._dtype))
+        ####################
         Bp_T = Bp * self._kT
         a = tf.cast(2.0, self._dtype) * self._gamma / self._omega * Bp_T
         b_const = tf.cast(0.0, self._dtype)  # second term dropped (negligible)
@@ -317,7 +367,18 @@ def build_controller(
     for h in hidden_sizes:
         x = tf.keras.layers.Dense(h, activation="tanh", dtype=dtype)(x)
     
-    raw = tf.keras.layers.Dense(3, activation="tanh", dtype=dtype)(x)
+    # raw = tf.keras.layers.Dense(3, activation="tanh", dtype=dtype)(x)
+    # separate Dense + scaled tanh
+    raw_pre = tf.keras.layers.Dense(3, activation=None, dtype=dtype)(x)
+    # Scale by 0.5 keeps tanh in the gradient-rich regime regardless of weight magnitudes.
+    # This is structural: any Dense layer with Glorot init produces pre-activations ~N(0, 1-3),
+    # which puts tanh in the saturation tail. Scaling by 0.5 keeps |tanh-input| ≤ ~1-2,
+    # where gradient is 0.4-0.6.
+    raw = tf.keras.layers.Lambda(
+        lambda x: tf.tanh(x * tf.cast(0.5, x.dtype)),
+        dtype=dtype,
+        name="scaled_tanh",
+    )(raw_pre)
 
     # New global layout: [within, mix, res, max_q, q_gap, phase_cos, phase_sin]
     within_log_std_norm = inputs[:, -7:-6]
@@ -410,6 +471,15 @@ class GravityGMSimulation(StatelessSimulation):
         self._k_ref_coarsest = tf.constant(
             2.0 * pi / self.prior_width, dtype=dtype,
         )
+        # F-V11 publication metric: track pure terminal-step MSE per training iter.
+        # This is NOT used for gradients — it's logged separately for the training-curve plot.
+        self._last_final_mse_norm = tf.Variable(0.0, trainable=False, dtype=dtype,
+                                                name="last_final_mse_norm")
+        self._last_final_max_q = tf.Variable(0.0, trainable=False, dtype=dtype,
+                                            name="last_final_max_q")
+        self._last_final_qclose = tf.Variable(0.0, trainable=False, dtype=dtype,
+                                            name="last_final_qclose")
+        
         # EMA-of-loss baseline state. Used to give REINFORCE an advantage
         # signal even when the batch is uniformly bad (e.g. policy collapsed).
         self._ema_decay = tf.constant(0.95, dtype=dtype)
@@ -447,9 +517,15 @@ class GravityGMSimulation(StatelessSimulation):
         )                                                                # (B,)
         batch_idx = tf.range(self.bs, dtype=tf.int32)
         gather_idx = tf.stack([batch_idx, true_mode_idx], axis=1)
+
         q_true = tf.gather_nd(self.bank.q, gather_idx)                  # (B,)
         q_true = tf.clip_by_value(q_true, tf.cast(1e-12, prec), tf.cast(1.0, prec))
-        nll_term = -tf.math.log(q_true)                                  # (B,)
+        # F-V11: focal NLL (γ=2) — down-weights already-won and already-lost cases,
+        # focuses gradient on mid-confidence improvable cases. Reduces REINFORCE variance.
+        gamma = tf.cast(2.0, prec)
+        focal_weight = tf.pow(tf.cast(1.0, prec) - q_true, gamma)
+        nll_term = -tf.math.log(q_true) * focal_weight       
+        
 
         # Small MSE term for early-trajectory signal
         g_hat, _ = self.bank.marginal_mean_and_var()
@@ -777,8 +853,44 @@ class GravityGMSimulation(StatelessSimulation):
                     used_resources, meas_step,
                 )
                 hist_loss.append(lv)
-
+       
         if not deploy:
+            # Detach bank state for diagnostic computation
+            bank_q_sg  = tf.stop_gradient(bank.q)
+            bank_mu_sg = tf.stop_gradient(bank.mu)
+
+            # Pure terminal MSE / Δg² (no NLL, no alpha blending)
+            final_g_true = true_values[:, 0, 0]                              # (B,)
+            final_g_hat = tf.reduce_sum(bank_q_sg * bank_mu_sg, axis=1)      # (B,)
+            final_err = final_g_hat - final_g_true
+            norm = tf.cast(self.prior_width ** 2, prec)
+            norm_safe = tf.maximum(norm, tf.cast(1e-30, prec))
+            final_mse_norm = tf.stop_gradient(
+                tf.reduce_mean(tf.square(final_err) / norm_safe)
+            )
+
+            # Bank diagnostics
+            final_max_q = tf.stop_gradient(
+                tf.reduce_mean(tf.reduce_max(bank_q_sg, axis=1))
+            )
+
+            # q at TRUE mode (closest mode by distance — robust to revival)
+            d = tf.abs(bank_mu_sg - tf.expand_dims(final_g_true, axis=1))    # (B, K)
+            true_mode_idx_v = tf.argmin(d, axis=1, output_type=tf.int32)     # (B,)
+            batch_idx_v = tf.range(self.bs, dtype=tf.int32)
+            gi = tf.stack([batch_idx_v, true_mode_idx_v], axis=1)
+            final_qclose = tf.stop_gradient(
+                tf.reduce_mean(tf.gather_nd(bank_q_sg, gi))
+            )
+
+            # Assign to variables (trainable=False, no gradient through assign)
+            self._last_final_mse_norm.assign(
+                tf.cast(final_mse_norm, self._last_final_mse_norm.dtype))
+            self._last_final_max_q.assign(
+                tf.cast(final_max_q, self._last_final_max_q.dtype))
+            self._last_final_qclose.assign(
+                tf.cast(final_qclose, self._last_final_qclose.dtype))
+                    
             if pars.cumulative_loss:
                 denom = tf.cast(max(step_count, 1), prec)
                 loss_diff_final = loss_diff_acc / denom
