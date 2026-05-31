@@ -158,29 +158,29 @@ class ControlScheduleLayer(tf.keras.layers.Layer):
         # We expose a feasible log-uniform k_g_target ∈ [k_g_min, k_g_max].
 
         ##########################
-        # # Bring in hbar
-        # hbar = tf.cast(phys_model.cfg.hbar_J_s, self._dtype)
-        # const_term = 8.0 * pi * self._gamma * hbar / tf.pow(self._omega, 3)
+        # Bring in hbar
+        hbar = tf.cast(phys_model.cfg.hbar_J_s, self._dtype)
+        const_term = 8.0 * pi * self._gamma * hbar / tf.pow(self._omega, 3)
 
-        # k_g_min_raw = (
-        #     2.0 * self._gamma / self._omega
-        #     * (self._Bp_min * self._kT) * tf.square(self._T_min)
-        #     + const_term * (self._Bp_min * self._kT)
-        # )
-        # k_g_max_raw = (
-        #     2.0 * self._gamma / self._omega
-        #     * (self._Bp_max * self._kT) * tf.square(self._T_max)
-        #     + const_term * (self._Bp_max * self._kT)
-        # )
-        ##########################
         k_g_min_raw = (
             2.0 * self._gamma / self._omega
             * (self._Bp_min * self._kT) * tf.square(self._T_min)
+            + const_term * (self._Bp_min * self._kT)
         )
         k_g_max_raw = (
             2.0 * self._gamma / self._omega
             * (self._Bp_max * self._kT) * tf.square(self._T_max)
+            + const_term * (self._Bp_max * self._kT)
         )
+        ##########################
+        # k_g_min_raw = (
+        #     2.0 * self._gamma / self._omega
+        #     * (self._Bp_min * self._kT) * tf.square(self._T_min)
+        # )
+        # k_g_max_raw = (
+        #     2.0 * self._gamma / self._omega
+        #     * (self._Bp_max * self._kT) * tf.square(self._T_max)
+        # )
         # Floor: at least `min_gain_fringe_fraction` fringes across prior.
         k_g_floor = tf.cast(
             float(min_gain_fringe_fraction) * 2.0 * pi / max(g_hi - g_lo, 1e-30),
@@ -301,20 +301,22 @@ class ControlScheduleLayer(tf.keras.layers.Layer):
             (u_B + tf.cast(1.0, self._dtype)) * tf.cast(0.5, self._dtype)
         ) * (Bp_high - Bp_low)
         ####################
-        # Bp_T = Bp * self._kT
-        # a = tf.cast(2.0, self._dtype) * self._gamma / self._omega * Bp_T
-        # # Wang Eq. (3) second term with ℏ — ~10⁻³⁴ smaller than the leading T²-scaled term.
-        # hbar = tf.cast(self._cfg.hbar_J_s, self._dtype)
-        # b_const = (
-        #     8.0 * tf.cast(pi, self._dtype) * self._gamma * hbar
-        #     / tf.pow(self._omega, 3) * Bp_T
-        # )
-        # T_sq = (k_g_target - b_const) / tf.maximum(a, tf.cast(1e-30, self._dtype))
-        ####################
         Bp_T = Bp * self._kT
         a = tf.cast(2.0, self._dtype) * self._gamma / self._omega * Bp_T
-        b_const = tf.cast(0.0, self._dtype)  # second term dropped (negligible)
+        # Wang Eq. (3) second term with ℏ — ~10⁻³⁴ smaller than the leading T²-scaled term.
+        hbar = tf.cast(self._cfg.hbar_J_s, self._dtype)
+        b_const = (
+            8.0 * tf.cast(pi, self._dtype) * self._gamma * hbar
+            / tf.pow(self._omega, 3) * Bp_T
+        )
         T_sq = (k_g_target - b_const) / tf.maximum(a, tf.cast(1e-30, self._dtype))
+        ####################
+        # Bp_T = Bp * self._kT
+        # a = tf.cast(2.0, self._dtype) * self._gamma / self._omega * Bp_T
+        # b_const = tf.cast(0.0, self._dtype)  # second term dropped (negligible)
+        # T_sq = (k_g_target - b_const) / tf.maximum(a, tf.cast(1e-30, self._dtype))
+        ####################
+        
         T_sq = tf.maximum(T_sq, tf.cast(0.0, self._dtype))
         T_s = tf.sqrt(T_sq)
         T_s = tf.clip_by_value(T_s, self._T_min, self._T_max)

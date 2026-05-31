@@ -254,39 +254,39 @@ class GravityStatelessPhysicalModel(StatelessPhysicalModel):
             / tf.cast(cfg.omega_rad_s, Bp_kTm.dtype)
         )
 
-    def k_g(self, T_s: Tensor, Bp_kTm: Tensor) -> Tensor:
-        """d(theta)/dg from Wang Eq. (3).
-
-        Δφ = (2 η / y0) g T² + 16 π η_g η
-        d Δφ / dg = (2 γ_e B' / ω) T² + (8 π γ_e B' ℏ / ω³)
-
-        The second term is ~10⁻³⁷ smaller than the first and is
-        dropped for clarity.
-        """
-        cfg = self.cfg
-        Bp_T_per_m = Bp_kTm * tf.cast(cfg.kT_to_T, T_s.dtype)
-        w = tf.cast(cfg.omega_rad_s, T_s.dtype)
-        ge = tf.cast(cfg.gamma_e_rad_s_T, T_s.dtype)
-        return (2.0 * ge / w) * Bp_T_per_m * tf.square(T_s)
-    
     # def k_g(self, T_s: Tensor, Bp_kTm: Tensor) -> Tensor:
-    #     """d(theta)/dg from Wang Eq. (3), including the ℏ-suppressed second term.
-        
-    #     Δφ = (2η/y₀) g T² + 16π η_g η
-    #     d Δφ/dg = (2 γ_e B'/ω) T² + (8π γ_e B' ℏ/ω³)
-        
-    #     The second term carries ℏ ≈ 10⁻³⁴ J·s, making it ~10⁻³⁴ smaller than
-    #     the first at typical operating points. Included here for physical
-    #     completeness; effectively a no-op numerically.
+    #     """d(theta)/dg from Wang Eq. (3).
+
+    #     Δφ = (2 η / y0) g T² + 16 π η_g η
+    #     d Δφ / dg = (2 γ_e B' / ω) T² + (8 π γ_e B' ℏ / ω³)
+
+    #     The second term is ~10⁻³⁷ smaller than the first and is
+    #     dropped for clarity.
     #     """
     #     cfg = self.cfg
     #     Bp_T_per_m = Bp_kTm * tf.cast(cfg.kT_to_T, T_s.dtype)
     #     w = tf.cast(cfg.omega_rad_s, T_s.dtype)
     #     ge = tf.cast(cfg.gamma_e_rad_s_T, T_s.dtype)
-    #     hbar = tf.cast(cfg.hbar_J_s, T_s.dtype)
-    #     t1 = (2.0 * ge / w) * Bp_T_per_m * tf.square(T_s)
-    #     t2 = (8.0 * tf.cast(pi, T_s.dtype) * ge * hbar / tf.pow(w, 3)) * Bp_T_per_m
-    #     return t1 + t2
+    #     return (2.0 * ge / w) * Bp_T_per_m * tf.square(T_s)
+    
+    def k_g(self, T_s: Tensor, Bp_kTm: Tensor) -> Tensor:
+        """d(theta)/dg from Wang Eq. (3), including the ℏ-suppressed second term.
+        
+        Δφ = (2η/y₀) g T² + 16π η_g η
+        d Δφ/dg = (2 γ_e B'/ω) T² + (8π γ_e B' ℏ/ω³)
+        
+        The second term carries ℏ ≈ 10⁻³⁴ J·s, making it ~10⁻³⁴ smaller than
+        the first at typical operating points. Included here for physical
+        completeness; effectively a no-op numerically.
+        """
+        cfg = self.cfg
+        Bp_T_per_m = Bp_kTm * tf.cast(cfg.kT_to_T, T_s.dtype)
+        w = tf.cast(cfg.omega_rad_s, T_s.dtype)
+        ge = tf.cast(cfg.gamma_e_rad_s_T, T_s.dtype)
+        hbar = tf.cast(cfg.hbar_J_s, T_s.dtype)
+        t1 = (2.0 * ge / w) * Bp_T_per_m * tf.square(T_s)
+        t2 = (8.0 * tf.cast(pi, T_s.dtype) * ge * hbar / tf.pow(w, 3)) * Bp_T_per_m
+        return t1 + t2
 
     def min_gain(self, dtype) -> Tensor:
         return self.k_g(
@@ -403,7 +403,7 @@ class GravityStatelessPhysicalModel(StatelessPhysicalModel):
             maxval=tf.cast(+bound, dtype),
             dtype=dtype,
         )
-
+    
     def _model_bias_factor(self, beta_B: Tensor) -> Tensor:
         cfg = self.cfg
         if cfg.infer_mfg_bias:
@@ -458,8 +458,8 @@ class GravityStatelessPhysicalModel(StatelessPhysicalModel):
         g, beta_B, phi_off = self._split_parameters(parameters)
         return self.likelihood_given_global_params(outcomes, controls, g, beta_B, phi_off)
 
+    
     # ---- True measurement (sampling) --------------------------------------
-
     def perform_measurement(
         self, controls: Tensor, parameters: Tensor, meas_step: Tensor,
         rangen: tf.random.Generator,
@@ -489,7 +489,7 @@ class GravityStatelessPhysicalModel(StatelessPhysicalModel):
             axis=1,
         )  # (B, 1)
         return outcomes, log_prob
-
+    
     # ---- Resource counting ------------------------------------------------
 
     def count_resources(

@@ -1,25 +1,14 @@
 # trainer_gm.py
-"""Trainer for the Gaussian-mixture gravimeter.
-
-This is a near drop-in replacement for the old `trainer_multi_pf.py`,
-with the following structural changes:
-
-1. Uses `GaussianMixtureBankConfig` and the closed-form GM bank.
-2. The training "loss" reported in tqdm and saved to JSONL is now
-   the framework's `log_loss` value, which is **log(mean MSE)** —
-   i.e. a positive-to-zero quantity that decreases as the controller
-   improves. A more negative value = better (because the MSE is < 1
-   in normalised units). This matches Belliardo Eq. 109.
-3. No EMA baseline. The framework's batch-mean baseline (Eq. 96) is
-   what's used inside `_compute_scalar_loss`-style code in execute().
-4. NOISE_MODE/PROFILE selection is unchanged.
-"""
 from __future__ import annotations
+import os
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ["TF_DETERMINISTIC_OPS"] = "1"
+os.environ["TF_CUDNN_DETERMINISTIC"] = "1"
 
 import importlib.util
 import json
 import math
-import os
+
 import random
 import sys
 import types
@@ -30,11 +19,6 @@ from typing import List, Optional
 import numpy as np
 import tensorflow as tf
 from tqdm.auto import trange
-
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
-os.environ["TF_DETERMINISTIC_OPS"] = "1"
-os.environ["TF_CUDNN_DETERMINISTIC"] = "1"
-
 
 def _load_local(module_name: str):
     root = Path(__file__).resolve().parent
@@ -109,7 +93,7 @@ class RunProfile:
 # Small, fast diagnostic profile. Use this to check pipeline correctness.
 DIAG_PROFILE = RunProfile(
     name="diag",
-    out_dir="runs/gravity_gm_v1",
+    out_dir="runs/gravity_gm_v3",
     batchsize=128,
     iterations=3000,
     interval_save=20,
