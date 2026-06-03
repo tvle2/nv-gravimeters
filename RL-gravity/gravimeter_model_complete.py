@@ -1,53 +1,6 @@
 # gravimeter_model_complete.py
-"""Physical model for the spin-optomechanical gravimeter.
-
-REVISED for the Gaussian-mixture bank pipeline.
-
-Implements the readout model from
-  Wang et al., "Enhanced Gravity Sensing by a Levitated Mesoscopic
-  Nanoparticle", Phys. Rev. Lett. 135, 120803 (2025),
-plugged into the StatelessPhysicalModel API of qsensoropt
-  (Belliardo et al., Phys. Rev. A 109, 062609 (2024)).
-
-Single-shot readout probability:
-    P(+1 | g, x) = 1/2 (1 + A · cos(k_g · g + φ_total))
-    φ_total = phi_off + phi_MW
-    k_g(T, B') = (2 γ_e B' / ω) · T²  +  (8π γ_e B' / ω³)
-
-A is the visibility (1 in the no-noise mode; reduced by trap noise and
-the spin coherence time T2_spin_s in 'paper' mode).
-
-Compatibility with the GM bank
-------------------------------
-The Gaussian-mixture bank (`GaussianMixtureBank`) requires:
-
-  * `phys_model.k_g(T, B')`              with T, B' of shape (B,)
-  * `phys_model.known_visibility_factor(T, B')`  with shape (B,)
-  * `phys_model.cfg.fixed_phi_off_rad`   (a float, used when
-    `infer_phi_off=False`)
-
-All three are implemented below. The GM bank currently supports
-**single-parameter** estimation of g; if `infer_phi_off=True`, the
-bank will silently *use* the fixed phi_off_rad and the controller will
-need to learn around the offset — which is wasteful but not incorrect.
-For joint (g, phi_off) inference, extend `GaussianMixtureBank` to a
-2-D Gaussian mixture (component covariances become 2×2).
-
-CHANGELOG vs. original
-----------------------
-[BUG-FIX] k_g second term was missing a factor of hbar in an earlier
-  draft.  Term is ~10^-36 of the leading T² term at typical parameters,
-  so the bug had no observable effect, but it's now physically correct.
-
-[NEW] Default T2_spin_s = 1 ms (conservative pre-DD, room-temp).
-
-[NEW] perform_measurement returns log_prob of shape (B, 1) (was (B,
-  1, 1)) to match what GravityGMSimulation expects.  Validated by
-  inspection of the existing code path: only the (B, 1) slice was
-  being used in the surrogate-loss accumulation.
-
-[ANNOTATION] Added a `validate_for_gm_bank()` method that raises a
-  clear error if the config is incompatible with the GM bank.
+"""
+Physical model for the spin-optomechanical gravimeter.
 """
 from __future__ import annotations
 
@@ -200,6 +153,16 @@ class GravityStatelessPhysicalModel(StatelessPhysicalModel):
             outcomes_size=1,
             prec=cfg.prec,
         )
+        # Per-trajectory MFG calibration bias ε ∈ U[-bound, +bound].
+        # Set once per trajectory by sample_mfg_calib_bias() from
+        # GravityGMSimulation.execute(); read every step by
+        # perform_measurement(). Wang SI §S7.A (slow calibration drift).
+        _eps_dtype = tf.float32 if cfg.prec == "float32" else tf.float64
+        self._mfg_eps_traj = tf.Variable(
+            tf.zeros((batchsize,), dtype=_eps_dtype),
+            trainable=False, name="mfg_eps_traj",
+        )
+
 
     # ---- Validation hook used by the GM bank pipeline ----------------------
 
@@ -404,6 +367,23 @@ class GravityStatelessPhysicalModel(StatelessPhysicalModel):
             dtype=dtype,
         )
     
+    def sample_mfg_calib_bias(self, rangen: tf.random.Generator) -> None:
+        """Wang-faithful MFG noise: draw ε ∈ U[-bound, +bound] ONCE per
+        trajectory and stash it in self._mfg_eps_traj.
+        """
+        bound = float(self.cfg.mfg_rel_noise_bound)
+        dtype = self._mfg_eps_traj.dtype
+        if bound <= 0.0:
+            self._mfg_eps_traj.assign(tf.zeros((self.bs,), dtype=dtype))
+            return
+        eps = rangen.uniform(
+            shape=(self.bs,),
+            minval=tf.cast(-bound, dtype),
+            maxval=tf.cast(+bound, dtype),
+            dtype=dtype,
+        )
+        self._mfg_eps_traj.assign(eps)
+
     def _model_bias_factor(self, beta_B: Tensor) -> Tensor:
         cfg = self.cfg
         if cfg.infer_mfg_bias:
@@ -470,7 +450,8 @@ class GravityStatelessPhysicalModel(StatelessPhysicalModel):
         mw_phase = controls[:, 0, 2]
         g, beta_B, phi_off = self._split_parameters(parameters)
         Bp_base_kTm = Bp_commanded_kTm * self._measurement_bias_factor(beta_B[:, 0])
-        eps = self._sample_mfg_rel_noise(tf.shape(Bp_base_kTm), rangen, Bp_base_kTm.dtype)
+        # eps = self._sample_mfg_rel_noise(tf.shape(Bp_base_kTm), rangen, Bp_base_kTm.dtype)
+        eps = tf.cast(self._mfg_eps_traj, Bp_base_kTm.dtype)
         Bp_kTm = Bp_base_kTm * (1.0 + eps)
         vis_true = self.sample_true_visibility_factor(T_s, Bp_kTm, rangen)
         theta = (

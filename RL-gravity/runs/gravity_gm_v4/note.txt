@@ -1,0 +1,39 @@
+DIAG_PROFILE = RunProfile(
+    name="diag",
+    out_dir="runs/gravity_gm_v4",
+    batchsize=128,
+    iterations=3000,
+    interval_save=20,
+    max_steps=64,
+    max_resources=120e-3,
+    initial_lr=2e-3,
+    grad_clip_norm=100.0,
+    seed=42,
+    gradient_accumulation=4,
+    K=4,
+    top_k_modes=4,
+    prec="float64",
+    cumulative_loss=True,
+    log_loss=False,             
+    loss_logl_outcomes=True,
+    baseline=True,
+    stop_gradient_input=False,
+    stop_gradient_pf=True,
+    eval_iters=32,
+)
+
+return GravimeterConfig(
+            **common,
+            T2_spin_s=1.0e-3,
+            mfg_rel_noise_bound=0.0,
+            mfg_noise_quad_points=1,
+            fixed_mfg_rel_bias=0.0,
+            apply_fixed_mfg_bias_in_model=True,
+            sigma_omega_rel=0.0,
+            trap_visibility_mode="none",
+            trap_noise_quad_points=1,
+        )
+
+Noise = none
+
+beta = 0.5

@@ -57,8 +57,7 @@ from gravimeter_gm_simulation import build_gravity_gm_simulation
 
 RUN_PROFILE: str = "diag"           # "diag", "diag_long", "pilot", "full"
 RUN_MODE: str = "all"               # "all", "train-only", "eval-only"
-NOISE_MODE: str = "none"            # "none" or "paper"
-
+NOISE_MODE: str = "paper"            # "none" or "paper"
 
 # ===========================================================================
 # RunProfile
@@ -93,7 +92,7 @@ class RunProfile:
 # Small, fast diagnostic profile. Use this to check pipeline correctness.
 DIAG_PROFILE = RunProfile(
     name="diag",
-    out_dir="runs/gravity_gm_v3",
+    out_dir="runs/gravity_gm_v4_noise",
     batchsize=128,
     iterations=3000,
     interval_save=20,
@@ -240,7 +239,7 @@ def make_gravimeter_cfg(profile: RunProfile) -> GravimeterConfig:
         return GravimeterConfig(
             **common,
             T2_spin_s=1.0e-3,
-            mfg_rel_noise_bound=0.0,
+            mfg_rel_noise_bound=3.0e-4,
             mfg_noise_quad_points=9,
             fixed_mfg_rel_bias=0.0,
             apply_fixed_mfg_bias_in_model=True,

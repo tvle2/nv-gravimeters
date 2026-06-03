@@ -1,35 +1,6 @@
 # gravimeter_gm_simulation.py
-"""StatelessSimulation wrapper for the Gaussian-mixture gravimeter.
-
-Replaces the previous `GravityMultiPFSimulation`. Key differences:
-
-1. Uses `GaussianMixtureBank` instead of a fixed-K bank of PFs.
-2. Loss = posterior squared error of the **mixture mean** estimator
-   (matches deployment, optimal under squared-error loss):
-
-       ℓ(ĝ, g_true) = (ĝ - g_true)² / Δg²,    ĝ = Σ_k q_k μ_k
-
-   This is the only loss function used; we no longer try to combine
-   posterior variance with bias on the assumption that the estimator
-   equals the truth.
-
-3. REINFORCE gradient construction follows Belliardo App. D.3 exactly:
-
-       L̃(λ) = ℓ + sg[ℓ - B] · log p(y | x, θ)
-
-   with B = batch-mean baseline. The REINFORCE surrogate is built
-   directly in the custom execute() loop using cumulative MSE
-   (Belliardo Eq. 106) with batch-mean baseline (Eq. 96).
-   log_loss=False; the framework's `_compute_scalar_loss` is NOT used.
-
-4. Cumulative loss is the simple time-average of ℓ_t (Belliardo Eq.
-   106). The MSE is normalised by Δg² for numerical stability.
-
-5. The controller input is leaner: per-mode (μ, σ, q) for the top-K
-   modes, plus 5 globals (within-mode log-σ, marginal log-σ, step,
-   resources, max-q).
-   No more "previous estimate" feature (it leaked over-confident
-   information).
+"""
+StatelessSimulation wrapper for the Gaussian-mixture gravimeter.
 """
 from __future__ import annotations
 
@@ -110,17 +81,6 @@ def gm_input_names(top_k_modes: int) -> list[str]:
 # Maps the controller's raw tanh outputs (u_kg, u_B, u_phi) plus
 # posterior-width and step-normalised features to physical controls
 # (T_s, B'_kTm, mw_phase_rad).
-#
-# Key change from the old version:
-#   * `min_gain_fringe_fraction` is allowed to be < 0.25 so that early
-#     measurements can be sub-fringe (mode-disambiguation regime).
-#   * Posterior-safe gain cap k_g ≤ 2π / (mult · σ_post) is applied
-#     SMOOTHLY (with min/max) and only as an upper bound — the lower
-#     bound is a fixed fraction of one fringe across the prior, ALWAYS
-#     achievable.
-#   * No schedule_floor: the controller is free to pick coarse or fine
-#     gains at any step. We let the network learn the schedule, not
-#     hard-code it.
 # ===========================================================================
 
 class ControlScheduleLayer(tf.keras.layers.Layer):
@@ -241,15 +201,7 @@ class ControlScheduleLayer(tf.keras.layers.Layer):
         sigma_g = sigma_frac * self._g_range
         sigma_g = tf.maximum(sigma_g, tf.cast(1e-30, self._dtype))
 
-        # # V8 posterior-adaptive cap: k_g_cap = π / σ_marginal.
-        # # sigma_g (computed above from mix_log_std_norm) already IS the marginal
-        # # posterior std. At init: σ_marginal ≈ Δg/√12 ≈ 0.013 → cap ≈ 245.
-        # # As bank localises: σ_marginal shrinks → cap auto-grows.
-        # # No threshold, no chicken-and-egg, no unimodality logic.
-        # #
-        # # Factor of π (not 2π) ensures the cosine fringe spacing 2π/k_g covers
-        # # at least 2·σ_marginal on each side of the bank's centre of mass — i.e.
-        # # the readout is unambiguous across the bulk of the current posterior.
+    
         k_post_cap = tf.cast(pi, self._dtype) / sigma_g
 
         # Bound by hardware max and the alias-safe floor.
@@ -257,21 +209,6 @@ class ControlScheduleLayer(tf.keras.layers.Layer):
         eff_k_g_max = tf.maximum(eff_k_g_max, self._k_g_min)
         log_eff_max = tf.math.log(eff_k_g_max) / tf.cast(np.log(10.0), self._dtype)
         log_k_g_min = self._log_k_g_min
-
-        # Physics-centered mapping:
-        # At u_kg = 0, k_g = min(πK/Δg, eff_k_g_max) — physics optimum subject to feasibility
-        # At u_kg = -1, k_g = k_g_min (coarsest hardware-allowed)
-        # At u_kg = +1, k_g = eff_k_g_max (finest σ-allowed)
-        # Piecewise-linear in log space, asymmetric to respect both bounds.
-        # log_center = tf.minimum(self._log_k_g_inter_opt, log_eff_max)
-        # log_range_neg = log_center - log_k_g_min        # half-range below center
-        # log_range_pos = log_eff_max - log_center        # half-range above center
-
-        # log_kg_target = log_center + tf.where(
-        #     u_kg < tf.cast(0.0, self._dtype),
-        #     u_kg * log_range_neg,
-        #     u_kg * log_range_pos,
-        # )
 
         log_kg_target = log_k_g_min + (
             (u_kg + tf.cast(1.0, self._dtype)) * tf.cast(0.5, self._dtype)
@@ -321,21 +258,6 @@ class ControlScheduleLayer(tf.keras.layers.Layer):
         T_s = tf.sqrt(T_sq)
         T_s = tf.clip_by_value(T_s, self._T_min, self._T_max)
 
-        # MW phase: F3-V10 — combine analytic greedy-φ optimum with a learned
-        # residual correction.
-        #
-        # The cosine readout's expected KL information gain at k_ref = π/σ_marg
-        # is maximised when the MW phase aligns the readout's cosine zero
-        # crossings with the bank's q-weighted "phase centroid":
-        #     φ_opt = -atan2(phase_sin, phase_cos) + π
-        # (the +π shift puts the zero crossing AT the centroid, so the two
-        # outcomes split mode probability mass as evenly as possible).
-        #
-        # u_phi ∈ [-1, 1] is the network's residual correction, scaled by
-        # `residual_amp` rad. residual_amp = π/4 gives the network ±45°
-        # of authority to override the analytic optimum when it has learned
-        # a better strategy (e.g. for trajectories near localisation where
-        # finer phase tuning matters).
         residual_amp = tf.cast(pi / 4.0, self._dtype)
         phi_opt = -tf.atan2(phase_sin, phase_cos) + tf.cast(pi, self._dtype)
         mw_phase = phi_opt + residual_amp * u_phi
@@ -497,18 +419,7 @@ class GravityGMSimulation(StatelessSimulation):
         weights: Tensor, particles: Tensor, true_values: Tensor,
         used_resources: Tensor, meas_step: Tensor,
     ) -> Tensor:
-        """V10: NLL on the true mode's q-weight, plus a tiny MSE term for early
-        training signal when q is still uniform.
-
-        Rationale: the mixture-mean MSE rewards splitting q across modes
-        that flank g_true. For K=8 with ~3 bits of measurement information,
-        the right objective is to maximise q on the mode containing g_true.
-        The NLL provides a direct gradient toward putting q on the truth.
-
-        For the first few steps (when q is uniform), NLL is ~log(K) constant
-        and gives no signal — so we add a small MSE term as a regulariser
-        that gets the bank moving in roughly the right direction.
-        """
+        
         del weights, particles, used_resources, meas_step
         prec = self.simpars.prec
         g_true = true_values[:, 0, 0]                                   # (B,)
@@ -522,8 +433,6 @@ class GravityGMSimulation(StatelessSimulation):
 
         q_true = tf.gather_nd(self.bank.q, gather_idx)                  # (B,)
         q_true = tf.clip_by_value(q_true, tf.cast(1e-12, prec), tf.cast(1.0, prec))
-        # F-V11: focal NLL (γ=2) — down-weights already-won and already-lost cases,
-        # focuses gradient on mid-confidence improvable cases. Reduces REINFORCE variance.
         gamma = tf.cast(2.0, prec)
         focal_weight = tf.pow(tf.cast(1.0, prec) - q_true, gamma)
         nll_term = -tf.math.log(q_true) * focal_weight       
@@ -537,7 +446,8 @@ class GravityGMSimulation(StatelessSimulation):
         mse_term = tf.square(err) / norm_safe
 
         # Equal weighting; the NLL term dominates as q diverges from uniform
-        beta = tf.cast(0.5, prec)
+        # \beta = 0.1 for noise and 0.5 for no noise
+        beta = tf.cast(0.1, prec)
         loss = beta * nll_term + (tf.cast(1.0, prec) - beta) * mse_term
         return tf.expand_dims(loss, axis=1)
 
@@ -629,18 +539,6 @@ class GravityGMSimulation(StatelessSimulation):
         # Max q — strong indicator of mode resolution
         max_q = tf.reduce_max(q, axis=1)
 
-        # ----- F3-V10: phase-distribution features at the reference k_ref ----
-        # These let the MLP express adaptive φ as a (near-)linear function:
-        #   φ_opt(state) ≈ -atan2(phase_sin, phase_cos) + π
-        # which is the analytic info-maximising MW phase for a cosine readout.
-        # Without these features, the MLP has to invent sin/cos in its hidden
-        # layers from (μ_k, q_k), which REINFORCE cannot teach in 500 iters.
-        #
-        # k_ref is chosen as the *current* V8/V9 posterior-adaptive cap π/σ_marg,
-        # so the trig features track the same scale the schedule decoder uses.
-        # Detached from the gradient (these are state diagnostics, not part of
-        # the controllable surface) — gradient still flows through controls
-        # → bank update → q,μ in future steps as usual.
         g_std_safe = tf.maximum(g_std, tf.cast(1e-30, prec))                # (B,)
         k_ref = tf.cast(np.pi, prec) / g_std_safe                            # (B,)
         # Offset μ_k by g_lo so the argument is order ~1 regardless of g_range location.
@@ -662,12 +560,7 @@ class GravityGMSimulation(StatelessSimulation):
     # ------------------------------------------------------------------
     # Episode loop
     # ------------------------------------------------------------------
-    #
-    # Implementation follows the *same skeleton* as the previous one, but
-    # the loss/REINFORCE surrogate is built using the framework's
-    # `_compute_scalar_loss` (which honours `log_loss`, `baseline`,
-    # `loss_logl_outcomes`, `cumulative_loss`).
-    # ------------------------------------------------------------------
+    
 
     def execute(
         self,
@@ -683,6 +576,11 @@ class GravityGMSimulation(StatelessSimulation):
         debug_records: List[dict] = [] if debug else None
 
         bank.reset(rangen)
+        # Per-trajectory MFG calibration bias (Wang SI §S7.A). Sampled once
+        # here, held constant by phys_model._mfg_eps_traj across all 64
+        # measurement steps in this rollout.
+        self.phys_model.sample_mfg_calib_bias(rangen)
+
         true_values = self.phys_model.true_values(rangen)
         true_state = self.phys_model.wrapper_initialize_state(true_values, 1)
 
@@ -781,10 +679,6 @@ class GravityGMSimulation(StatelessSimulation):
             # and the *cumulative* objective gradient is (1/M_eff) Σ_t s_t
             # — i.e. we average over steps at the very end.
             #
-            # NOTE: We deliberately do NOT use the framework's
-            # `log_loss=True` arithmetic together with cumulative loss.
-            # Per Belliardo App. D.4 these are alternatives. This block
-            # implements cumulative-MSE only.
             # ============================================================
             if not deploy:
                 loss_values = self.loss_function(

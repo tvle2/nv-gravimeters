@@ -1,2 +1,0 @@
-noise = none
-T_2 = 1 ms
