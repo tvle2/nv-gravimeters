@@ -57,7 +57,7 @@ from gravimeter_gm_simulation import build_gravity_gm_simulation
 
 RUN_PROFILE: str = "diag"           # "diag", "diag_long", "pilot", "full"
 RUN_MODE: str = "all"               # "all", "train-only", "eval-only"
-NOISE_MODE: str = "paper"            # "none" or "paper"
+NOISE_MODE: str = "none"            # "none" or "paper"
 
 # ===========================================================================
 # RunProfile
@@ -92,14 +92,14 @@ class RunProfile:
 # Small, fast diagnostic profile. Use this to check pipeline correctness.
 DIAG_PROFILE = RunProfile(
     name="diag",
-    out_dir="runs/gravity_gm_v4_noise",
+    out_dir="runs/gravity_gm_final_no_noise",
     batchsize=128,
     iterations=3000,
     interval_save=20,
-    max_steps=64,
-    max_resources=120e-3,
+    max_steps=128,
+    max_resources=500e-3,
     initial_lr=2e-3,
-    grad_clip_norm=100.0,
+    grad_clip_norm=500.0,
     seed=42,
     gradient_accumulation=4,
     K=4,
@@ -114,88 +114,13 @@ DIAG_PROFILE = RunProfile(
     eval_iters=32,
 )
 
-# Longer diagnostic.
-DIAG_LONG_PROFILE = RunProfile(
-    name="diag_long",
-    out_dir="runs/gravity_gm_diag_long",
-    batchsize=128,
-    iterations=2000,
-    interval_save=100,
-    max_steps=32,
-    max_resources=100e-3,
-    initial_lr=2e-3,
-    grad_clip_norm=10.0,
-    seed=42,
-    gradient_accumulation=1,
-    K=64,
-    top_k_modes=4,
-    prec="float64",
-    cumulative_loss=False,
-    log_loss=False,
-    loss_logl_outcomes=True,
-    baseline=True,
-    stop_gradient_input=True,
-    stop_gradient_pf=True,
-    eval_iters=128,
-)
 
-# Production-scale (large batch, long episodes).
-PILOT_PROFILE = RunProfile(
-    name="pilot",
-    out_dir="runs/gravity_gm_pilot",
-    batchsize=256,
-    iterations=5000,
-    interval_save=250,
-    max_steps=32,
-    max_resources=100e-3,
-    initial_lr=3e-3,
-    grad_clip_norm=10.0,
-    seed=42,
-    gradient_accumulation=1,
-    K=64,
-    top_k_modes=4,
-    prec="float64",
-    cumulative_loss=True,
-    log_loss=False,
-    loss_logl_outcomes=True,
-    baseline=True,
-    stop_gradient_input=True,
-    stop_gradient_pf=True,
-    eval_iters=256,
-)
-
-FULL_PROFILE = RunProfile(
-    name="full",
-    out_dir="runs/gravity_gm_full",
-    batchsize=512,
-    iterations=20000,
-    interval_save=500,
-    max_steps=64,
-    max_resources=200e-3,
-    initial_lr=3e-3,
-    grad_clip_norm=10.0,
-    seed=123,
-    gradient_accumulation=2,
-    K=128,
-    top_k_modes=4,
-    prec="float64",
-    cumulative_loss=True,
-    log_loss=False,
-    loss_logl_outcomes=True,
-    baseline=True,
-    stop_gradient_input=True,
-    stop_gradient_pf=True,
-    eval_iters=512,
-)
 
 
 def get_profile() -> RunProfile:
     k = RUN_PROFILE.strip().lower()
     return {
         "diag": DIAG_PROFILE,
-        "diag_long": DIAG_LONG_PROFILE,
-        "pilot": PILOT_PROFILE,
-        "full": FULL_PROFILE,
     }[k]
 
 
@@ -214,8 +139,8 @@ def make_gravimeter_cfg(profile: RunProfile) -> GravimeterConfig:
         infer_mfg_bias=False,
         infer_phi_off=False,
         fixed_phi_off_rad=0.0,
-        T_range_s=(10e-6, 5e-4),
-        Bp_range_kTm=(0.5, 25.0),
+        T_range_s=(30e-6, 1.0e-3),
+        Bp_range_kTm=(0.5, 100.0),
         readout_flip_prob=0.0,
         dead_time_s=0.0,
         mfg_resource_cost_s_at_ref=0.0,
@@ -226,7 +151,7 @@ def make_gravimeter_cfg(profile: RunProfile) -> GravimeterConfig:
     if mode == "none":
         return GravimeterConfig(
             **common,
-            T2_spin_s=1.0e-3,
+            T2_spin_s=2.0e-3,
             mfg_rel_noise_bound=0.0,
             mfg_noise_quad_points=1,
             fixed_mfg_rel_bias=0.0,
@@ -238,7 +163,7 @@ def make_gravimeter_cfg(profile: RunProfile) -> GravimeterConfig:
     if mode == "paper":
         return GravimeterConfig(
             **common,
-            T2_spin_s=1.0e-3,
+            T2_spin_s=2.0e-3,
             mfg_rel_noise_bound=3.0e-4,
             mfg_noise_quad_points=9,
             fixed_mfg_rel_bias=0.0,
@@ -384,7 +309,7 @@ def run_training(profile: RunProfile) -> None:
             with tf.GradientTape() as tape:
                 if debug and acc_i == profile.gradient_accumulation - 1:
                     loss_diff, loss, dbg = sim.execute(
-                        rangen, debug=True, debug_max_examples=3,
+                        rangen, debug=True, debug_max_examples=128,
                     )
                     records.extend(dbg)
                 else:
@@ -416,12 +341,22 @@ def run_training(profile: RunProfile) -> None:
     best_loss = float("inf")
     best_ckpt_idx = 1
 
+    # === EMA smoothing for reported loss (Fig 1a) ===
+    EMA_ALPHA = 0.05  # effective window ≈ 20 iters
+    loss_ema = None
+
     pbar = trange(profile.iterations, desc="Training", unit="step")
     for j in pbar:
         debug_now = ((j + 1) % profile.interval_save == 0)
         step_loss, raw_norm, clip_norm, dbg = one_grad_step(debug=debug_now)
         loss_history.append(step_loss)
         recent = float(np.mean(loss_history[max(0, j - 19): j + 1]))
+
+        # EMA-smoothed loss for publication plot
+        if loss_ema is None:
+            loss_ema = float(step_loss)
+        else:
+            loss_ema = EMA_ALPHA * float(step_loss) + (1.0 - EMA_ALPHA) * loss_ema
 
         try:
             lr_val = float(lr_schedule(optimizer.iterations).numpy())
@@ -446,6 +381,7 @@ def run_training(profile: RunProfile) -> None:
             "final_qclose":   float(sim._last_final_qclose.numpy()),
             # Existing fields:
             "avg20": float(recent),
+            "loss_ema": float(loss_ema),
             "best": float(best_loss) if np.isfinite(best_loss) else None,
             "raw_grad_norm": float(raw_norm),
             "clip_grad_norm": float(clip_norm),

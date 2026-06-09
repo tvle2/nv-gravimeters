@@ -56,15 +56,6 @@ Key properties
   wrong mode.
 * O(B·K) memory and compute (vs O(B·K·N) for per-mode PFs).
 
-Compatibility
--------------
-Implements the same interface used by `gravimeter_multi_pf.py`:
-  bank.reset(rangen)
-  bank.apply_measurement(outcomes, controls, meas_step, continue_flag, ...)
-  bank.mode_means_and_stds() -> (means[B,K], stds[B,K])
-  bank.marginal_mean_and_var() -> (mean[B], var[B])
-  bank.mode_weights -> Tensor[B,K]
-  bank.K -> int
 """
 from __future__ import annotations
 

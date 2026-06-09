@@ -5,6 +5,7 @@ RL-gravity/bin
 RL-gravity/include
 RL-gravity/lib
 RL-gravity/share
+RL-gravity/runs/gravity_gm_final_no_noise
 RL-gravity/lib64
 RL-gravity/pyvenv.cfg
 __pycache__/

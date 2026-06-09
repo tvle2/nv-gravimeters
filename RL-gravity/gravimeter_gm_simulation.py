@@ -7,6 +7,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 import types
+import math
 from math import pi
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -112,13 +113,8 @@ class ControlScheduleLayer(tf.keras.layers.Layer):
         g_lo, g_hi = float(cfg.g_range[0]), float(cfg.g_range[1])
         self._g_range = tf.constant(max(g_hi - g_lo, 1e-30), dtype=self._dtype)
 
-        # The available k_g range:
-        #   k_g(T, B') = (2γ/ω) B' T² + (8π γ / ω³) B'
-        # so at fixed B', k_g varies with T². And at fixed T, k_g ∝ B'.
-        # We expose a feasible log-uniform k_g_target ∈ [k_g_min, k_g_max].
 
-        ##########################
-        # Bring in hbar
+       
         hbar = tf.cast(phys_model.cfg.hbar_J_s, self._dtype)
         const_term = 8.0 * pi * self._gamma * hbar / tf.pow(self._omega, 3)
 
@@ -132,45 +128,53 @@ class ControlScheduleLayer(tf.keras.layers.Layer):
             * (self._Bp_max * self._kT) * tf.square(self._T_max)
             + const_term * (self._Bp_max * self._kT)
         )
-        ##########################
-        # k_g_min_raw = (
-        #     2.0 * self._gamma / self._omega
-        #     * (self._Bp_min * self._kT) * tf.square(self._T_min)
-        # )
-        # k_g_max_raw = (
-        #     2.0 * self._gamma / self._omega
-        #     * (self._Bp_max * self._kT) * tf.square(self._T_max)
-        # )
-        # Floor: at least `min_gain_fringe_fraction` fringes across prior.
+
+        # Lower floor: at least `min_gain_fringe_fraction` fringes across prior.
         k_g_floor = tf.cast(
             float(min_gain_fringe_fraction) * 2.0 * pi / max(g_hi - g_lo, 1e-30),
             self._dtype,
         )
         self._k_g_min = tf.maximum(k_g_min_raw, k_g_floor)
         self._K_cast = tf.constant(float(K), dtype=self._dtype)
-        # Physics-defined inter-mode discrimination optimum:
-        # k_g_inter_opt = π * K / Δg
-        # At this k_g, two adjacent modes give maximally distinguishable outcomes.
+
+        # Physics-defined inter-mode discrimination optimum: π·K/Δg
+        # (kept for reference; not used in the new cap rule below).
         self._k_g_inter_opt = (
             tf.cast(pi, self._dtype) * self._K_cast / self._g_range
         )
         self._log_k_g_inter_opt = (
             tf.math.log(self._k_g_inter_opt) / tf.cast(np.log(10.0), self._dtype)
         )
-        # Hard prior-aliasing cap: at k_g > π/Δg the cosine readout has more than
-        # half a fringe across the prior, so modes on different fringes are aliased
-        # (same Z up to damp differences). Independent of K — the prior width is
-        # what bounds the unambiguous range.
-        k_g_alias_cap = tf.cast(
-            pi / max(g_hi - g_lo, 1e-30),
+
+        # Hardware ceiling from (T_s, B') ranges. The previous static
+        # k_g_alias_cap = π/Δg is REMOVED — the new cap is dynamic and
+        # protects within-mode, between-mode, and identifiability simultaneously.
+        self._k_g_hw_max = k_g_max_raw
+
+        # === Adaptive cap parameters ===
+        # mode_width = Δg / K. Used as the between-mode aliasing floor when q
+        # is still uniform (bank can't disambiguate adjacent modes).
+        self._mode_width = tf.cast(
+            max(g_hi - g_lo, 1e-30) / float(K),
             self._dtype,
         )
-        self._k_g_alias_cap = k_g_alias_cap        
-        self._k_g_hw_max    = k_g_max_raw            
-        self._k_g_max       = tf.minimum(k_g_max_raw, k_g_alias_cap)   
+        # K-modes (already self._K_cast) and 1/K for q-uniformity normalization.
+        self._inv_K = tf.cast(1.0 / float(K), self._dtype)
+        # Identifiability noise floor σ_floor = g · MFG_bound / √3.
+        # Prevents division by tiny σ_within in noise-free mode where the bank
+        # can in principle drive σ_within → 0.
+        mfg_bound = float(getattr(self._cfg, "mfg_rel_noise_bound", 0.0))
+        g_typ_for_floor = 9.81  # m/s² — for noise-floor calc only
+        self._eps_floor = tf.constant(
+            max(mfg_bound * g_typ_for_floor / np.sqrt(3.0), 1e-12),
+            dtype=self._dtype,
+        )
+        
+        self._cap_margin = tf.cast(0.5, self._dtype)
+        
 
         self._log_k_g_min = tf.math.log(self._k_g_min) / tf.cast(np.log(10.0), self._dtype)
-        self._log_k_g_max = tf.math.log(self._k_g_max) / tf.cast(np.log(10.0), self._dtype)
+        # self._log_k_g_max = tf.math.log(self._k_g_max) / tf.cast(np.log(10.0), self._dtype)
 
         self._posterior_gain_width_multiplier = tf.constant(
             float(posterior_gain_width_multiplier), dtype=self._dtype,
@@ -182,6 +186,7 @@ class ControlScheduleLayer(tf.keras.layers.Layer):
             float(log_sigma_frac_bounds[1]), dtype=self._dtype,
         )
 
+    '''############### V4###########
     def call(self, x):
         u_kg = x[:, 0:1]
         u_B = x[:, 1:2]
@@ -269,8 +274,122 @@ class ControlScheduleLayer(tf.keras.layers.Layer):
         ) - tf.cast(pi, self._dtype)
 
         return tf.concat([T_s, Bp, mw_phase], axis=1)
+    '''
+    def call(self, x):
+        u_kg = x[:, 0:1]
+        u_B = x[:, 1:2]
+        u_phi = x[:, 2:3]
+        within_log_std_norm = x[:, 3:4]
+        mix_log_std_norm = x[:, 4:5]
+        max_q = x[:, 5:6]
+        q_gap = x[:, 6:7]
+        phase_cos = x[:, 7:8]
+        phase_sin = x[:, 8:9]
 
-    
+        # Decode mix_log_std_norm → σ_marginal
+        log_sigma_frac = self._log_sigma_frac_lo + (
+            (mix_log_std_norm + tf.cast(1.0, self._dtype)) * tf.cast(0.5, self._dtype)
+        ) * (self._log_sigma_frac_hi - self._log_sigma_frac_lo)
+        sigma_frac = tf.pow(tf.cast(10.0, self._dtype), log_sigma_frac)
+        sigma_g = sigma_frac * self._g_range
+        sigma_g = tf.maximum(sigma_g, tf.cast(1e-30, self._dtype))
+
+        # === Adaptive cap — three-way protection ===
+        # σ_eff = max(σ_within, q_uniformity·mode_width, ε_floor)
+        # cap = (π · margin) / σ_eff  with margin = 0.5 (visibility-aware)
+
+        # σ_within: within-mode aliasing protection.
+        # Decode within_log_std_norm → σ_within in m/s².
+        log_within_frac = self._log_sigma_frac_lo + (
+            (within_log_std_norm + tf.cast(1.0, self._dtype)) * tf.cast(0.5, self._dtype)
+        ) * (self._log_sigma_frac_hi - self._log_sigma_frac_lo)
+        sigma_within = tf.pow(tf.cast(10.0, self._dtype), log_within_frac) * self._g_range
+        sigma_within = tf.maximum(sigma_within, tf.cast(1e-30, self._dtype))
+
+        # q-uniformity: between-mode aliasing protection.
+        # When q is uniform (random init), adjacent modes cannot be discriminated
+        # at high k_g. q_uniformity scales 1 (uniform) → 0 (concentrated).
+        #   q_unif = (1 - max_q) / (1 - 1/K)
+        # At init max_q = 1/K → q_unif = 1; at full localization max_q → 1 → q_unif = 0.
+        one = tf.cast(1.0, self._dtype)
+        q_uniformity = tf.maximum(
+            (one - max_q) / (one - self._inv_K),
+            tf.cast(0.0, self._dtype),
+        )
+
+        # (c) σ_eff = max of three protections; ε_floor prevents division-by-tiny
+        # in noise-free training (σ_within can drive to zero).
+        sigma_eff = tf.maximum(sigma_within, q_uniformity * self._mode_width)
+        sigma_eff = tf.maximum(sigma_eff, self._eps_floor)
+
+        # Adaptive cap with π/2 visibility-aware margin.
+        k_post_cap = (self._cap_margin * tf.cast(pi, self._dtype)) / sigma_eff
+
+        # Bound by hardware max and the lower k_g floor.
+        eff_k_g_max = tf.minimum(k_post_cap, self._k_g_hw_max)
+        eff_k_g_max = tf.maximum(eff_k_g_max, self._k_g_min)
+        log_eff_max = tf.math.log(eff_k_g_max) / tf.cast(np.log(10.0), self._dtype)
+        log_k_g_min = self._log_k_g_min
+
+        log_kg_target = log_k_g_min + (
+            (u_kg + tf.cast(1.0, self._dtype)) * tf.cast(0.5, self._dtype)
+        ) * (log_eff_max - log_k_g_min)
+        k_g_target = tf.pow(tf.cast(10.0, self._dtype), log_kg_target)
+        
+
+        # Solve for (T, B') given k_g_target. We pick B' first in its
+        # feasible interval determined by T ∈ [T_min, T_max], then back
+        # out T = sqrt((k_g_target - b)/a).
+        C_T_min = (
+            tf.cast(2.0, self._dtype) * self._gamma / self._omega * tf.square(self._T_min)
+        )
+        C_T_max = (
+            tf.cast(2.0, self._dtype) * self._gamma / self._omega * tf.square(self._T_max)
+        )
+        Bp_feas_low = k_g_target / tf.maximum(
+            C_T_max * self._kT, tf.cast(1e-30, self._dtype),
+        )
+        Bp_feas_high = k_g_target / tf.maximum(
+            C_T_min * self._kT, tf.cast(1e-30, self._dtype),
+        )
+
+        Bp_low = tf.maximum(self._Bp_min, Bp_feas_low)
+        Bp_high = tf.maximum(tf.minimum(self._Bp_max, Bp_feas_high), Bp_low)
+        Bp = Bp_low + (
+            (u_B + tf.cast(1.0, self._dtype)) * tf.cast(0.5, self._dtype)
+        ) * (Bp_high - Bp_low)
+        ####################
+        Bp_T = Bp * self._kT
+        a = tf.cast(2.0, self._dtype) * self._gamma / self._omega * Bp_T
+        # Wang Eq. (3) second term with ℏ — ~10⁻³⁴ smaller than the leading T²-scaled term.
+        hbar = tf.cast(self._cfg.hbar_J_s, self._dtype)
+        b_const = (
+            8.0 * tf.cast(pi, self._dtype) * self._gamma * hbar
+            / tf.pow(self._omega, 3) * Bp_T
+        )
+        T_sq = (k_g_target - b_const) / tf.maximum(a, tf.cast(1e-30, self._dtype))
+        ####################
+        # Bp_T = Bp * self._kT
+        # a = tf.cast(2.0, self._dtype) * self._gamma / self._omega * Bp_T
+        # b_const = tf.cast(0.0, self._dtype)  # second term dropped (negligible)
+        # T_sq = (k_g_target - b_const) / tf.maximum(a, tf.cast(1e-30, self._dtype))
+        ####################
+        
+        T_sq = tf.maximum(T_sq, tf.cast(0.0, self._dtype))
+        T_s = tf.sqrt(T_sq)
+        T_s = tf.clip_by_value(T_s, self._T_min, self._T_max)
+
+        residual_amp = tf.cast(pi / 4.0, self._dtype)
+        phi_opt = -tf.atan2(phase_sin, phase_cos) + tf.cast(pi, self._dtype)
+        mw_phase = phi_opt + residual_amp * u_phi
+        # Wrap to [-π, π] for downstream consumers (the bank uses cos/sin
+        # so this is cosmetic, but keeps the debug output readable).
+        mw_phase = tf.math.floormod(
+            mw_phase + tf.cast(pi, self._dtype),
+            tf.cast(2.0 * pi, self._dtype),
+        ) - tf.cast(pi, self._dtype)
+
+        return tf.concat([T_s, Bp, mw_phase], axis=1)
 
 # ===========================================================================
 # Build the controller MLP
@@ -435,7 +554,7 @@ class GravityGMSimulation(StatelessSimulation):
         q_true = tf.clip_by_value(q_true, tf.cast(1e-12, prec), tf.cast(1.0, prec))
         gamma = tf.cast(2.0, prec)
         focal_weight = tf.pow(tf.cast(1.0, prec) - q_true, gamma)
-        nll_term = -tf.math.log(q_true) * focal_weight       
+        nll_term = -tf.math.log(q_true) * focal_weight  
         
 
         # Small MSE term for early-trajectory signal
@@ -447,7 +566,7 @@ class GravityGMSimulation(StatelessSimulation):
 
         # Equal weighting; the NLL term dominates as q diverges from uniform
         # \beta = 0.1 for noise and 0.5 for no noise
-        beta = tf.cast(0.1, prec)
+        beta = tf.cast(0.5, prec)
         loss = beta * nll_term + (tf.cast(1.0, prec) - beta) * mse_term
         return tf.expand_dims(loss, axis=1)
 
